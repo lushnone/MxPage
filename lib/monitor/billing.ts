@@ -89,7 +89,69 @@ export function readBillingRequest(body: unknown): BillingRequest {
     }
   }
   if (value.response_format) text += JSON.stringify(value.response_format);
-  return { textTokens: approximateTextTokens(text), inputImages, quality: value.quality, size: value.size, imageCount: nonnegative(value.n) ?? 1, serviceTier: value.service_tier };
+  const openAiImageRefs = value.image == null ? 0 : Array.isArray(value.image) ? value.image.length : 1;
+  return {
+    textTokens: approximateTextTokens(text),
+    inputImages: inputImages + openAiImageRefs,
+    quality: value.quality,
+    size: value.size,
+    imageCount: nonnegative(value.n) ?? 1,
+    serviceTier: value.service_tier,
+  };
+}
+
+export type ApiRequestSummary = {
+  model?: string;
+  promptChars?: number;
+  referenceImageCount?: number;
+  referenceImageBytes?: number;
+  referenceImageKinds?: Array<"data-url" | "http-url" | "other">;
+  size?: string;
+  quality?: string;
+  n?: number;
+};
+
+function classifyImageRef(value: unknown): "data-url" | "http-url" | "other" {
+  if (typeof value !== "string") return "other";
+  if (/^data:image\//i.test(value)) return "data-url";
+  if (/^https?:\/\//i.test(value)) return "http-url";
+  return "other";
+}
+
+/** 监控用：不写入 base64，只记字段与体量，便于本地对照 request / response / status。 */
+export function summarizeApiRequestBody(body: unknown): ApiRequestSummary {
+  if (!body) return {};
+  if (typeof body === "string") {
+    try {
+      return summarizeApiRequestBody(JSON.parse(body));
+    } catch {
+      return {};
+    }
+  }
+  if (typeof FormData !== "undefined" && body instanceof FormData) {
+    const files = [...body.getAll("image"), ...body.getAll("image[]")];
+    return {
+      model: String(body.get("model") || "") || undefined,
+      promptChars: String(body.get("prompt") || "").length,
+      referenceImageCount: files.length,
+      size: String(body.get("size") || "") || undefined,
+      quality: String(body.get("quality") || "") || undefined,
+    };
+  }
+  const value = body as Record<string, unknown>;
+  const refs = value.image == null ? [] : Array.isArray(value.image) ? value.image : [value.image];
+  const kinds = refs.map(classifyImageRef);
+  const referenceImageBytes = refs.reduce((sum, item) => sum + (typeof item === "string" ? item.length : 0), 0);
+  return {
+    model: typeof value.model === "string" ? value.model : undefined,
+    promptChars: typeof value.prompt === "string" ? value.prompt.length : undefined,
+    referenceImageCount: refs.length,
+    referenceImageBytes: refs.length ? referenceImageBytes : undefined,
+    referenceImageKinds: kinds.length ? kinds : undefined,
+    size: typeof value.size === "string" ? value.size : undefined,
+    quality: typeof value.quality === "string" ? value.quality : undefined,
+    n: nonnegative(value.n) ?? undefined,
+  };
 }
 export function estimateImageOutputTokens(family: "image25" | "image2", quality: string, size: string) {
   const [width, height] = size.split("x").map(Number);

@@ -67,8 +67,16 @@ async function ensureDesktopRuntimeConfig() {
       ? currentConfig.appSecret
       : crypto.randomBytes(32).toString("hex");
 
+  const DEFAULT_DESKTOP_PORT = 37651;
+  const preferredPort =
+    typeof currentConfig.serverPort === "number" && currentConfig.serverPort >= 1024 && currentConfig.serverPort <= 65535
+      ? currentConfig.serverPort
+      : DEFAULT_DESKTOP_PORT;
+
   const nextConfig = {
+    ...currentConfig,
     appSecret,
+    serverPort: preferredPort,
     updatedAt: new Date().toISOString(),
   };
 
@@ -80,6 +88,8 @@ async function ensureDesktopRuntimeConfig() {
     storageDir,
     databasePath: path.join(prismaDir, "dev.db"),
     appSecret,
+    configPath,
+    preferredPort,
   };
 }
 
@@ -204,8 +214,16 @@ async function startNextServer(runtime) {
     throw new Error(`Missing Next standalone server entry: ${serverEntry}`);
   }
 
-  const port = await findAvailablePort(3000);
+  const port = await findAvailablePort(runtime.preferredPort ?? 37651);
   const env = getRuntimeEnv(runtime, port);
+
+  const persisted = (await readJson(runtime.configPath)) ?? {};
+  await writeJson(runtime.configPath, {
+    ...persisted,
+    appSecret: runtime.appSecret,
+    serverPort: port,
+    updatedAt: new Date().toISOString(),
+  });
 
   serverProcess = spawn(process.execPath, [serverEntry], {
     cwd: getStandaloneRoot(),

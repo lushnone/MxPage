@@ -6,6 +6,27 @@ function providerHttpStatus(error: unknown) {
   return value?.status ?? value?.statusCode ?? Number(value?.message?.match(/^(?:HTTP\s+)?([45]\d\d)\b/i)?.[1] || 0);
 }
 
+function probeUpstreamText(error: unknown): string {
+  const parts: string[] = [];
+  let current: unknown = error;
+  for (let depth = 0; depth < 5 && current; depth++) {
+    if (current && typeof current === "object" && "message" in current) {
+      const message = (current as { message?: string }).message;
+      if (typeof message === "string" && message.trim()) parts.push(message);
+    }
+    current = (current as { cause?: unknown })?.cause;
+  }
+  return parts.join(" ");
+}
+
+export function isModelAccessDenied(error: unknown): boolean {
+  const text = probeUpstreamText(error).toLowerCase();
+  const status = providerHttpStatus(error)
+    || providerHttpStatus((error as { cause?: unknown })?.cause)
+    || Number(text.match(/\b403\b/)?.[0] || 0);
+  return status === 403 && /access to model denied|not eligible|eligible for using the model|model access denied|模型.*(?:未开通|无权限)|无权.*模型/.test(text);
+}
+
 // Only an explicit 400 schema rejection proves that generation did not start.
 // Do not treat timeouts, response parse failures or other 4xx as safe to resend.
 export function isStructuredSchemaRejection(error: unknown) {
@@ -23,14 +44,30 @@ export function requestErrorMessage(error: unknown, fallback = "操作暂未完�
   if (value?.code === "IMAGE_TASK_PENDING") return "图片结果查询暂未完成，上游任务编号已保存。继续任务只查询原结果，不会重新提交生图。";
   if (value?.code === "P2025") return "该项目或任务已不存在，请返回我的作品。";
   if (value?.code === "ENOENT") return "所需素材文件已不存在，请重新上传素材后继续。";
-  if (error instanceof ZodError) return "返回的数据格式不完整，当前步骤已暂停，已有结果已保留。";
+  if (error instanceof ZodError) {
+    const text = (error as Error).message || "";
+    if (/结构化 JSON 校验失败|模型返回摘录/.test(text)) return `${text.slice(0, 1500)}当前步骤已暂停，已有结果已保留。`;
+    const fields = error.issues.slice(0, 4).map(issue => issue.path.join(".") || "root").join("、");
+    return fields
+      ? `返回的数据格式不完整（字段：${fields}），当前步骤已暂停，已有结果已保留。`
+      : "返回的数据格式不完整，当前步骤已暂停，已有结果已保留。";
+  }
   if (error instanceof SyntaxError) return "服务返回的数据无法读取，请检查服务状态后继续。";
-  const message = value?.message || "";
-  const status = providerHttpStatus(error);
+  const message = probeUpstreamText(error) || value?.message || "";
+  const status = providerHttpStatus(error) || providerHttpStatus((error as { cause?: unknown })?.cause);
+  if (status === 400 && /invalidparameter|invalid_parameter|max_tokens|max_completion_tokens/i.test(`${value?.code || ""} ${message}`)) {
+    return `模型服务拒绝了请求参数（HTTP 400）${message ? `：${message.replace(/^<\d+>\s*/, "").slice(0, 500)}` : "，请检查输出 token 上限等设置。"}`;
+  }
   if (isStructuredSchemaRejection(error)) return "模型服务拒绝了请求的数据格式，尚未开始生成。请更新应用后继续任务，无需更换 API Key。";
   const network = networkErrorCode(error);
   if (/timeout|timed out|aborterror|\b504\b/i.test(message) || /TIMEOUT|ETIMEDOUT/.test(network || "")) return "服务响应超时，结果暂未确认。请先查看任务进度，避免重复提交。";
   if (/fetch failed|failed to fetch|network error|load failed/i.test(message) || network) return "连接暂时中断，请检查网络。已保存的结果仍可查看，请勿重复提交任务。";
+  if (
+    status === 403
+    && /access to model denied|not eligible for using the model|model access denied|模型.*(?:未开通|无权限|不可用)|无权.*模型/i.test(message)
+  ) {
+    return "当前 API Key 有效，但该工作空间未开通此模型的调用权限。请在百炼控制台开通对应模型，或把默认改为已开通的模型（如 qwen-plus / qwen3.8-flash）。";
+  }
   if ([401, 403].includes(status) || /\bunauthorized\b|\binvalid_api_key\b|\b(?:invalid|incorrect|expired|revoked)\s+(?:api[ _-]?)?(?:key|token)\b/i.test(message)) return "模型服务鉴权失败，请检查 API 配置。";
   if (/rate limit|\b429\b/i.test(message)) return "模型服务当前繁忙，请稍后继续。";
   if (/\b50[023]\b/.test(message)) return "模型服务暂时不可用，已有结果已保留，请稍后继续。";

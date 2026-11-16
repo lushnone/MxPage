@@ -58,6 +58,12 @@ next-env.d.ts
 /storage/
 /storage-backups/
 /prisma/dev.db
+/dev.db
+Private.md
+
+# local package manager experiments (canonical install: npm ci)
+/pnpm-lock.yaml
+/pnpm-workspace.yaml
 *.db-wal
 *.db-shm
 *.db-journal

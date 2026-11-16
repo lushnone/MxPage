@@ -10,7 +10,7 @@ import { z } from "zod";
 import sharp from "sharp";
 import { prisma } from "@/lib/db/prisma";
 import { getProviderAdapter, snapshotProvider, type ProviderSnapshot } from "@/lib/services/provider-service";
-import { runWithProviderCredentials, type RequestProviderCredentials } from "@/lib/services/provider-runtime";
+import { resolveEffectiveBaseUrl, runWithProviderCredentials, type RequestProviderCredentials } from "@/lib/services/provider-runtime";
 import { readStorageFile, saveGeneratedImage } from "@/lib/storage/asset-manager";
 import { detailRunInputSchema, socialPostSchema, type DetailRunInput } from "./contracts";
 import { xhsImageCount } from "./xhs";
@@ -28,6 +28,9 @@ import { claimRunLease, RunHalted, RUN_LEASE_MS } from "./run-lease";
 import { isStructuredSchemaRejection, requestErrorMessage } from "@/lib/utils/request-error";
 import { networkErrorCode } from "@/lib/utils/network-error";
 import { incompleteSupplementalEstimates, missingFieldSchema, normalizeSupplementalQuestions, resolveSupplementalSubmission, supplementalInputInstructions, supplementalQuestionsFromFields, supplementalQuestionIssues, supplementalSuggestionsSchema, type StoredSupplementalQuestion } from "./supplemental-input";
+import { artDirectionBatchRanges, artDirectionBatchSize, artDirectionRequestKey, shouldBatchArtDirection } from "./art-direction-batches";
+import { artDirectionSchemaWithNormalization, alignArtDirectionSections } from "./normalize-art-direction";
+import { alignPlanSectionKinds, planSchemaWithNormalization } from "./normalize-plan-response";
 
 const json = (value: unknown) => JSON.parse(JSON.stringify(value)) as Prisma.InputJsonValue;
 const active = ["PENDING", "RUNNING", "WAITING_INPUT", "WAITING_PROMPTS"];
@@ -35,6 +38,24 @@ const SKIP_INPUT_PREFIX = "按现有信息继续；";
 const INPUT_STAGE_LABEL = "请确认商品补充信息";
 const SUGGESTION_TASK = "只生成三个逐题弹窗的问题及每题三个具体候选答案，不重做商品规划。questions[].fields 使用 requiredFields 中的原始字段 ID，合并分组时也必须包含所有原始 ID；补充的商品场景或人群问题可使用新字段 ID。";
 const workers = (globalThis as typeof globalThis & { detailV4Workers?: Set<string> }).detailV4Workers ??= new Set();
+/** 每个请求键默认只发起一次模型调用；明确授权后才允许第二次。 */
+export const V4_MAX_REQUEST_ATTEMPTS = 1;
+
+const REQUEST_STAGE_LABELS: Record<string, string> = {
+  PLAN: "规划商品内容",
+  ART_DIRECTION: "设计视觉分镜",
+  INPUT_SUGGESTIONS: "推断商品补充选项",
+  PREPARE: "准备商品资料",
+};
+
+function requestStageLabel(key: string) {
+  if (key.startsWith("GENERATE:")) return "生成图片";
+  if (key.startsWith("IMAGE_REVIEW:")) return "检查图片";
+  if (key.startsWith("SET_REVIEW:")) return "检查整套页面";
+  const artBatch = /^ART_DIRECTION:(\d+)-(\d+)$/.exec(key);
+  if (artBatch) return `设计视觉分镜（第 ${Number(artBatch[1]) + 1}–${Number(artBatch[2]) + 1} 屏）`;
+  return REQUEST_STAGE_LABELS[key] || key;
+}
 
 const planSchema = z.object({
   productName: z.string().min(1).max(100), category: z.string().min(1).max(80), facts: z.array(z.string().min(1).max(500)).max(40),
@@ -97,6 +118,35 @@ function isTimeout(error: unknown) {
   const value = error as { name?: string; code?: string; message?: string } | null;
   return /timeout|timed out|abort/i.test(`${value?.name || ""} ${value?.code || ""} ${value?.message || String(error)}`);
 }
+
+/** 多图 + 多屏完整文案规划在百炼上常超过 3 分钟；按屏数与图片量放宽上限（最长 7 分钟）。 */
+export function planRequestTimeoutMs(input: Pick<DetailRunInput, "heroCount" | "detailCount" | "mode">, imageCount: number) {
+  const sections = input.heroCount + input.detailCount;
+  if (input.mode === "xhs") return Math.min(420_000, 120_000 + input.detailCount * 20_000);
+  return Math.min(420_000, Math.max(300_000, 150_000 + sections * 15_000 + imageCount * 20_000));
+}
+
+/** 百炼 / DashScope chat 对 max_tokens 上限常为 8192，超出会直接 HTTP 400。 */
+export function planMaxOutputTokens(baseUrl: string) {
+  try {
+    const host = new URL(baseUrl).hostname.toLowerCase();
+    if (/aliyuncs\.com$/.test(host) || host.includes("dashscope")) return 8192;
+  } catch { /* ignore */ }
+  return 16_384;
+}
+
+export function artDirectionRequestTimeoutMs(sectionCount: number) {
+  return Math.min(420_000, Math.max(180_000, 120_000 + sectionCount * 20_000));
+}
+
+/** Token Plan / 百炼 qwen-image 图生图常超过 3 分钟；客户端过早 abort 会标成「中断」而上游可能仍在跑。 */
+export function v4ImageGenerationTimeoutMs(baseUrl: string) {
+  try {
+    const host = new URL(baseUrl).hostname.toLowerCase();
+    if (/aliyuncs\.com$/.test(host) || host.includes("dashscope")) return 600_000;
+  } catch { /* ignore */ }
+  return 180_000;
+}
 function checksComplete(cp: V4Checkpoint) {
   return cp.images.length > 0 && cp.images.every(image => image.assetId && image.state === "checked" && image.check?.passed === true && !image.check.issues.some(issue => issue.severity === "error")) && cp.setReview?.passed === true && cp.setReview.issues.length === 0;
 }
@@ -146,7 +196,7 @@ export async function createV4DetailRun(projectId: string, raw: unknown, credent
   if (snapshot?.workType === "translation" || snapshot?.translationReady) throw new Error("翻译项目请在详情页翻译入口处理。");
   if (!project.assets.length && input.mode !== "xhs") throw new Error("请先上传商品素材。");
   const { provider } = await getProviderAdapter();
-  const planningModelId = selectModel(provider.models, "planning", undefined, project.assets.length > 0);
+  const planningModelId = selectModel(provider.models, "planning");
   const analysisModelId = selectModel(provider.models, "analysis");
   const heroModelId = input.heroCount ? selectModel(provider.models, "hero") : undefined;
   const imageModelId = input.detailCount ? selectModel(provider.models, "detail") : heroModelId!;
@@ -232,7 +282,7 @@ export async function controlV4DetailRun(projectId: string, runId: string, actio
     return getV4DetailRun(projectId, runId);
   }
   if (action === "cancel") { await prisma.detailRun.updateMany({ where: { id: runId, status: { in: active } }, data: { status: "CANCELED", stage: "已停止" } }); return getV4DetailRun(projectId, runId); }
-  if (run.status === "RUNNING" || run.status === "PENDING") return getV4DetailRun(projectId, runId);
+  if (run.status === "RUNNING") return getV4DetailRun(projectId, runId);
   if (workers.has(runId) || (run.leaseToken && run.leaseUntil && run.leaseUntil.getTime() > Date.now())) {
     // A concurrent click may have started the worker after our status read.
     // Reuse that work; only a canceled worker must finish before resuming.
@@ -272,7 +322,11 @@ export async function controlV4DetailRun(projectId: string, runId: string, actio
     if (!cp.plan || !(invalid || cp.lastError?.stage === "ART_DIRECTION")) throw new Error("当前没有可重试的失败分镜。");
     if (cp.images.some(image => image.assetId || image.state !== "pending") || Object.keys(cp.requests).some(key => key.startsWith("GENERATE:")) || cp.promptReview?.approvedAt) throw new Error("已确认提示词或已发起图片请求，不能重做分镜。");
     cp.artDirection = undefined;
-    cp.retryAuthorized = ["ART_DIRECTION"];
+    const batchBaseUrl = resolveEffectiveBaseUrl((run.input as { providerSnapshot?: ProviderSnapshot }).providerSnapshot?.baseUrl);
+    const artBatches = shouldBatchArtDirection(batchBaseUrl, expected)
+      ? artDirectionBatchRanges(expected, artDirectionBatchSize(batchBaseUrl, expected))
+      : [{ start: 0, end: expected }];
+    cp.retryAuthorized = artBatches.map(range => artDirectionRequestKey(range.start, range.end, expected));
     cp.promptReview = { revision: (cp.promptReview?.revision ?? 0) + 1, pages: [] };
   }
   if (action === "suggestions") {
@@ -310,11 +364,70 @@ export async function controlV4DetailRun(projectId: string, runId: string, actio
   return getV4DetailRun(projectId, runId);
 }
 
+export async function syncV4RunProviderInput<T extends DetailRunInput & {
+  planningModelId: string; analysisModelId?: string; heroModelId?: string; imageModelId: string; editModelId?: string;
+  providerSnapshot?: ProviderSnapshot; xhsPromptPack?: XhsPromptPack;
+}>(input: T): Promise<T> {
+  const { provider } = await getProviderAdapter(input.providerSnapshot?.id, input.providerSnapshot, { legacyTextProtocol: !input.providerSnapshot });
+  const planningModelId = selectModel(provider.models, "planning");
+  const analysisModelId = selectModel(provider.models, "analysis");
+  const heroModelId = input.heroCount ? selectModel(provider.models, "hero") : input.heroModelId;
+  const imageModelId = input.detailCount
+    ? selectModel(provider.models, "detail")
+    : (heroModelId || selectModel(provider.models, "hero"));
+  // 详情页 V4 主流程不依赖修图默认；仅当用户在设置里指定了「图像编辑」默认时才刷新，避免未配置修图时无法续跑 PLAN。
+  const editModelId = provider.models.some(model => model.isDefaultImageEdit && model.isAvailable !== false)
+    ? selectModel(provider.models, "edit")
+    : input.editModelId;
+  return {
+    ...input,
+    planningModelId,
+    analysisModelId,
+    ...(heroModelId ? { heroModelId } : {}),
+    imageModelId,
+    ...(editModelId ? { editModelId } : {}),
+    providerSnapshot: snapshotProvider(provider),
+  };
+}
+
 async function executeV4(runId: string) {
   const lease = await claimRunLease(runId);
-  if (!lease) return;
+  if (!lease) {
+    await prisma.detailRun.updateMany({
+      where: { id: runId, status: "PENDING" },
+      data: {
+        status: "FAILED",
+        stage: "任务未能启动",
+        error: "任务停在「准备中」：无法获取执行权。请刷新页面后再次点击继续；若仍卡住，请关闭其它正在跑同一任务的窗口。",
+      },
+    });
+    return;
+  }
   const run = await prisma.detailRun.findUniqueOrThrow({ where: { id: runId } }).catch(async error => { await lease.release(); throw error; });
-  const input = run.input as unknown as DetailRunInput & { planningModelId: string; analysisModelId?: string; heroModelId?: string; imageModelId: string; editModelId: string; providerSnapshot?: ProviderSnapshot; xhsPromptPack?: XhsPromptPack };
+  const storedInput = run.input as unknown as DetailRunInput & { planningModelId: string; analysisModelId?: string; heroModelId?: string; imageModelId: string; editModelId: string; providerSnapshot?: ProviderSnapshot; xhsPromptPack?: XhsPromptPack };
+  let input: typeof storedInput;
+  try {
+    input = await syncV4RunProviderInput(storedInput);
+  } catch (error) {
+    const message = requestErrorMessage(error, "当前模型配置无法继续本任务，请检查 API 设置中的默认模型。");
+    await lease.transaction(async tx => {
+      await tx.detailRun.update({
+        where: { id: runId },
+        data: { status: "FAILED", stage: "模型配置无效", error: message, checkpoint: json({ ...(run.checkpoint as object), lastError: { stage: "PREPARE", code: "PROVIDER_MODEL_INVALID", message, retryable: false } }) },
+      });
+    });
+    await lease.release();
+    return;
+  }
+  const providerInputChanged = input.planningModelId !== storedInput.planningModelId
+    || input.analysisModelId !== storedInput.analysisModelId
+    || input.heroModelId !== storedInput.heroModelId
+    || input.imageModelId !== storedInput.imageModelId
+    || input.editModelId !== storedInput.editModelId
+    || input.providerSnapshot?.id !== storedInput.providerSnapshot?.id;
+  if (providerInputChanged) {
+    await prisma.detailRun.update({ where: { id: runId }, data: { input: json(input) } });
+  }
   const cp = run.checkpoint as unknown as V4Checkpoint;
   cp.requests ??= {};
   cp.taskTiming = startTiming(cp.taskTiming);
@@ -344,8 +457,20 @@ async function executeV4(runId: string) {
     const previous = cp.requests![key];
     const queryExisting = key.startsWith("GENERATE:") && (previous?.resultSource || (previous?.upstreamTask && previous.upstreamTask.status !== "failed"));
     const authorized = cp.retryAuthorized?.includes(key);
+    const spent = cp.attempts[key] || 0;
     if (cp.recoverImagesOnly && !queryExisting) throw new Error("仅恢复已有图片：未发起新的模型请求，请单独确认后继续任务。");
-    if (previous && previous.state !== "rejected" && !authorized && !queryExisting) throw new Error(`${key} 上次请求结果未确认，已跳过；如需重新请求，请勾选可能再次计费的重试选项。`);
+    if (previous && !queryExisting && !authorized) {
+      // uncertain：上游可能已计费，需勾选重试；rejected：本地/格式问题，修好配置后可直接再试。
+      const needsRetryConsent = ["uncertain", "running"].includes(previous.state)
+        || (spent >= V4_MAX_REQUEST_ATTEMPTS && previous.state !== "rejected");
+      if (needsRetryConsent) {
+        const detail = previous.error?.trim() || requestErrorMessage({ message: cp.lastError?.message });
+        throw Object.assign(
+          new Error(`「${requestStageLabel(key)}」已尝试 ${Math.max(spent, 1)} 次未成功：${detail} 若要再调模型，请勾选「重试结果不确定的请求」。`),
+          { code: previous.failureCode || "WORKFLOW_REQUEST_FAILED" },
+        );
+      }
+    }
     cp.retryAuthorized = cp.retryAuthorized?.filter(item => item !== key);
     const requestId = queryExisting ? previous!.requestId : randomUUID();
     cp.requests![key] = { state: "running", requestId, ...(queryExisting ? { upstreamTask: previous!.upstreamTask, resultSource: previous!.resultSource } : {}) };
@@ -372,7 +497,15 @@ async function executeV4(runId: string) {
       }
       // The provider may have accepted/billed a request even when no result reached us.
       cp.requestTimings![key] = { ...cp.requestTimings![key], ...touchTiming(cp.requestTimings![key], true) };
-      cp.requests![key] = { ...cp.requests![key], state: isStructuredSchemaRejection(error) || (error as { code?: string })?.code === "LOCAL_BUDGET_PAUSED" ? "rejected" : "uncertain", requestId, failureCode: (error as { code?: string })?.code, error: requestErrorMessage(error, "请求结果未确认，已有结果已保留。") };
+      const httpStatus = (error as { status?: number })?.status;
+      const paramRejected = httpStatus === 400 && /invalidparameter|invalid_parameter|max_tokens/i.test(`${(error as { code?: string })?.code || ""} ${error instanceof Error ? error.message : ""}`);
+      cp.requests![key] = {
+        ...cp.requests![key],
+        state: isStructuredSchemaRejection(error) || paramRejected || (error as { code?: string })?.code === "LOCAL_BUDGET_PAUSED" ? "rejected" : "uncertain",
+        requestId,
+        failureCode: (error as { code?: string })?.code,
+        error: requestErrorMessage(error, "请求结果未确认，已有结果已保留。"),
+      };
       await persist();
       throw error;
     }
@@ -401,16 +534,24 @@ async function executeV4(runId: string) {
     const confirmedEstimates = cp.confirmedSupplementalAnswers?.some(answer => answer.basis === "model_estimate") === true;
     let plan = cp.plan;
     const requestPlanSchema: z.ZodType<WorkflowPlan> = input.mode === "xhs" ? xhsPlanSchema : planSchema;
-    // Planning includes image input and complete page copy. Responses may send
-    // headers early while still generating; allow three minutes for completion.
-    if (!plan) plan = await requestOnce("PLAN", requestId => invokeStructured({ ...textSettings(input.providerSnapshot || {}), apiKey, baseUrl: provider.baseUrl, model: input.planningModelId, schema: requestPlanSchema, system: input.mode === "xhs"
+    const planSchemaForCall = planSchemaWithNormalization(requestPlanSchema, {
+      productName: current.name,
+      heroCount: input.heroCount,
+      detailCount: input.detailCount,
+    }) as z.ZodType<WorkflowPlan>;
+    const planTimeoutMs = planRequestTimeoutMs(input, images.length);
+    const planSchemaHint = `必须返回完整根字段 productName、category、facts、missingFields、sections。sections 共 ${input.heroCount + input.detailCount} 项：前 ${input.heroCount} 项 kind=HERO，后 ${input.detailCount} 项 kind=DETAIL。每项用 title/objective/buyerQuestion/copy/evidence(字符串数组)，不要用 sectionIndex。`;
+    if (!plan) plan = await requestOnce("PLAN", requestId => invokeStructured({ ...textSettings(input.providerSnapshot || {}), apiKey, baseUrl: provider.baseUrl, model: input.planningModelId, schema: planSchemaForCall, system: input.mode === "xhs"
       ? `${input.xhsPromptPack?.planning || ""}\n你是小红书图文规划模型。只返回 JSON。按用户主题创作标题、正文、3–8个标签和恰好${input.detailCount}张3:4竖版配图的完整文案，全部 sections.kind 为 DETAIL，不生成 HERO。post 包含 title、caption、hashtags、language，遵守用户字数与语言要求；productName 是主题名。不要编造个人经历、事实数据、品牌功效或来源。普通知识/插画创作不需要商品材质、尺寸等参数，contentCoverage 返回空数组，不套用电商详情页八模块。只有确实阻止主题创作的信息才列入 missingFields；无需补充则为空。sections[].copy 写该图可见的完整文字，evidence 只用 evidenceCatalog 内的 ID。`
-      : `${buildCommerceSystemPrompt(current.platform, ["hero_search", "feature_proof", "lifestyle", "material_closeup", "specification", "trust", "summary"])}\n你是商品规划模型。只返回 JSON。写出有证据的商品事实、买家价值和完整的逐屏内容；未知字段放入 missingFields，不要设计字体、背景或工具调用。sections[].copy 是最终需要呈现的完整文案，包含标题、解释、标签与已知参数，每条独立文案换行，不写Markdown装饰或制作说明，不用只有标题的提纲代替内容。\n${input.detailCount === 0 ? coverageRules : "完整详情任务的 contentCoverage 逐项交代八类内容：covered 必须引用真实承载该内容的详情页下标（全套从0开始，不能只引用HERO）；needs_input 写明具体缺失资料；not_applicable 写明产品或用户范围依据。少屏可以合并内容模块，不允许用“简洁”“留白”作为省略理由。缺失的用户要求应进入missingFields。"}\n证据引用规则：sections[].evidence 只能填写 evidenceCatalog 中的 id（user_description 或真实资产 ID），不要填写自然语言证据句。`, input: planInput, images, timeoutMs: 180000, maxAttempts: 1, requestId, monitor: { projectId, runId, operation: "v4_plan" } }), result => { cp.plan = result; });
+      : `${buildCommerceSystemPrompt(current.platform, ["hero_search", "feature_proof", "lifestyle", "material_closeup", "specification", "trust", "summary"])}\n你是商品规划模型。只返回 JSON。${planSchemaHint}\n写出有证据的商品事实、买家价值和完整的逐屏内容；未知字段放入 missingFields，不要设计字体、背景或工具调用。sections[].copy 是最终需要呈现的完整文案，包含标题、解释、标签与已知参数，每条独立文案换行，不写Markdown装饰或制作说明，不用只有标题的提纲代替内容。\n${input.detailCount === 0 ? coverageRules : "完整详情任务的 contentCoverage 逐项交代八类内容：covered 必须引用真实承载该内容的详情页下标（全套从0开始，不能只引用HERO）；needs_input 写明具体缺失资料；not_applicable 写明产品或用户范围依据。少屏可以合并内容模块，不允许用“简洁”“留白”作为省略理由。缺失的用户要求应进入missingFields。"}\n证据引用规则：sections[].evidence 只能填写 evidenceCatalog 中的 id（user_description 或真实资产 ID），不要填写自然语言证据句。`, input: planInput, images, timeoutMs: planTimeoutMs, maxOutputTokens: planMaxOutputTokens(provider.baseUrl), maxAttempts: 1, requestId, monitor: { projectId, runId, operation: "v4_plan" } }), result => { cp.plan = result; });
     if (!plan) throw new Error("规划结果为空");
     if (confirmedEstimates) plan = { ...plan, sections: plan.sections.map(section => ({ ...section, title: customerFacingCopy(section.title) || "商品信息", copy: customerFacingCopy(section.copy) })) };
     const expected = input.heroCount + input.detailCount;
-    const countIssues = [plan.sections.filter(s => s.kind === "HERO").length !== input.heroCount ? `HERO 数量必须为 ${input.heroCount}` : "", plan.sections.filter(s => s.kind === "DETAIL").length !== input.detailCount ? `DETAIL 数量必须为 ${input.detailCount}` : ""].filter(Boolean);
-    if (countIssues.length) throw new Error(countIssues.join("；"));
+    plan = { ...plan, sections: alignPlanSectionKinds(plan.sections, input.heroCount, input.detailCount) };
+    cp.plan = plan;
+    if (plan.sections.length !== expected) {
+      throw new Error(`规划屏数应为 ${expected} 屏（主图 ${input.heroCount} + 详情 ${input.detailCount}），与你在任务里选的默认一致；模型只返回了 ${plan.sections.length} 屏，请勾选重试规划或换规划模型。`);
+    }
     // Models sometimes return a useful evidence description instead of the
     // requested source ID. Keep that description grounded by mapping it to
     // the only valid source categories before the strict local check.
@@ -488,14 +629,106 @@ async function executeV4(runId: string) {
     });
     await end("PLAN");
     await begin("ART_DIRECTION");
-    const requestDirectionSchema = directionSchema.extend({ sections: directionSchema.shape.sections.length(expected) });
-    const art = cp.artDirection ?? await requestOnce("ART_DIRECTION", requestId => invokeStructured({ ...textSettings(input.providerSnapshot || {}), apiKey, baseUrl: provider.baseUrl, model: input.planningModelId, schema: requestDirectionSchema, system: input.xhsPromptPack?.artDirection || `${buildCommerceSystemPrompt(current.platform, ["hero_search", "feature_proof", "lifestyle", "material_closeup", "specification", "trust", "summary"])}\n${confirmedAnswerCopyRules}\n你是视觉分镜模型。只返回完整 JSON。根据完整内容任务设计每张图的构图、光线、场景、文字和信息模块，sectionIndex必须对应规划从0开始的下标。plan.sections[].copy 是内容基础，可以自然润色标题、调整句式、标点和换行，无需逐字复刻；保持完整买家信息、参数标签、数值、单位和尺寸表，不把完整页面简化成只有标题。不要删除页面，不要编造规格。每张最终prompt必须完整描述主体、镜头、环境、光线、配色、细节/信息模块与排版，最终可见文字以textBlocks为准；不能只写标题或依赖前一张图。按内容安排场景、微距、标注、信息图与规格表，避免所有页面同一背景加整件产品。`, input: JSON.stringify({ plan, expectedSectionCount: expected, sectionSlots, sectionIndexRule: "Return exactly one section per slot, with unique sectionIndex from 0 to expectedSectionCount - 1. Do not merge or omit slots.", platform: current.platform, language: input.language, userInstruction, referenceRoles, brief: input.xhsPromptPack?.brief }), images: visualImages, timeoutMs: Math.max(90000, Math.min(180000, expected * 15000)), maxAttempts: 1, requestId, monitor: { projectId, runId, operation: "v4_art_direction" } }).catch(error => { if (error instanceof z.ZodError) throw new InvalidStoryboard(`视觉分镜结构不合格，需要 ${expected} 张完整分镜。请确认后仅重试分镜，已完成规划会保留。`); throw error; }), result => { cp.artDirection = result; });
+    const planSectionHints = plan.sections.map(section => ({ title: section.title, objective: section.objective, copy: section.copy, kind: section.kind }));
+    type ArtDirectionResult = z.infer<typeof directionSchema>;
+    const artDirectionBaseSystem = input.xhsPromptPack?.artDirection || `${buildCommerceSystemPrompt(current.platform, ["hero_search", "feature_proof", "lifestyle", "material_closeup", "specification", "trust", "summary"])}\n${confirmedAnswerCopyRules}\n你是视觉分镜模型。只返回完整 JSON。根据完整内容任务设计每张图的构图、光线、场景、文字和信息模块，sectionIndex必须对应规划从0开始的下标。plan.sections[].copy 是内容基础，可以自然润色标题、调整句式、标点和换行，无需逐字复刻；保持完整买家信息、参数标签、数值、单位和尺寸表，不把完整页面简化成只有标题。不要删除页面，不要编造规格。每张最终prompt必须完整描述主体、镜头、环境、光线、配色、细节/信息模块与排版，最终可见文字以textBlocks为准；不能只写标题或依赖前一张图。按内容安排场景、微距、标注、信息图与规格表，避免所有页面同一背景加整件产品。`;
+    const artBatches = shouldBatchArtDirection(provider.baseUrl, expected)
+      ? artDirectionBatchRanges(expected, artDirectionBatchSize(provider.baseUrl, expected))
+      : [{ start: 0, end: expected }];
+    const sectionMap = new Map<number, ArtDirectionResult["sections"][number]>();
+    for (const section of cp.artDirection?.sections ?? []) {
+      if (section.sectionIndex >= 0 && section.sectionIndex < expected) sectionMap.set(section.sectionIndex, section);
+    }
+    let sharedConcept = cp.artDirection?.concept || "";
+    let sharedPalette = cp.artDirection?.palette || [];
+    let sharedTypography = cp.artDirection?.typography || "清晰易读";
+    const persistArtDirectionDraft = () => {
+      cp.artDirection = {
+        concept: sharedConcept,
+        palette: sharedPalette,
+        typography: sharedTypography,
+        sections: alignArtDirectionSections(
+          Array.from({ length: expected }, (_, index) => sectionMap.get(index)).filter(Boolean),
+          expected,
+          planSectionHints,
+        ),
+      };
+    };
+    const invokeArtBatch = async (range: { start: number; end: number }, requestId: string) => {
+      const batchCount = range.end - range.start;
+      const batchPlanHints = planSectionHints.slice(range.start, range.end);
+      const batchSlots = sectionSlots.slice(range.start, range.end);
+      const batchSchema = artDirectionSchemaWithNormalization(
+        directionSchema.extend({ sections: directionSchema.shape.sections.length(batchCount) }),
+        { expectedSectionCount: batchCount, planSections: batchPlanHints },
+      ) as z.ZodType<ArtDirectionResult>;
+      const batchHint = batchCount === expected
+        ? `必须返回恰好 ${expected} 个 sections，sectionIndex 从 0 到 ${expected - 1} 各一张，不得合并或省略。每张含 expression、prompt、textBlocks。`
+        : `本批只设计第 ${range.start + 1}–${range.end} 屏（sectionIndex ${range.start}–${range.end - 1}），共 ${batchCount} 个 sections；不要返回其它下标。`;
+      const result = await invokeStructured({
+        ...textSettings(input.providerSnapshot || {}),
+        apiKey,
+        baseUrl: provider.baseUrl,
+        model: input.planningModelId,
+        schema: batchSchema,
+        system: `${artDirectionBaseSystem}\n${batchHint}`,
+        input: JSON.stringify({
+          plan,
+          expectedSectionCount: batchCount,
+          sectionIndexRange: { from: range.start, to: range.end - 1 },
+          sectionSlots: batchSlots,
+          sectionIndexRule: `Return exactly ${batchCount} sections with sectionIndex from ${range.start} to ${range.end - 1}.`,
+          platform: current.platform,
+          language: input.language,
+          userInstruction,
+          referenceRoles,
+          brief: input.xhsPromptPack?.brief,
+          sharedVisualDirection: { concept: sharedConcept, palette: sharedPalette, typography: sharedTypography },
+        }),
+        images: visualImages,
+        timeoutMs: artDirectionRequestTimeoutMs(batchCount),
+        maxOutputTokens: planMaxOutputTokens(provider.baseUrl),
+        maxAttempts: 1,
+        requestId,
+        monitor: { projectId, runId, operation: "v4_art_direction" },
+      }).catch(error => {
+        if (error instanceof z.ZodError) {
+          throw new InvalidStoryboard(`视觉分镜结构不合格：第 ${range.start + 1}–${range.end} 屏本批需要 ${batchCount} 张，模型 JSON 不完整（常见为输出被 8192 token 截断）。请点「仅重试视觉分镜」，规划会保留。`);
+        }
+        throw error;
+      });
+      const aligned = alignArtDirectionSections(result.sections, batchCount, batchPlanHints).map((section, offset) => ({ ...section, sectionIndex: range.start + offset }));
+      return { ...result, sections: aligned };
+    };
+    const artComplete = cp.artDirection && !storyboardIssue(cp.artDirection.sections, expected);
+    if (!artComplete) {
+      for (const range of artBatches) {
+        const missing = Array.from({ length: range.end - range.start }, (_, offset) => range.start + offset).some(index => !sectionMap.has(index));
+        if (!missing) continue;
+        const key = artDirectionRequestKey(range.start, range.end, expected);
+        const batchArt = await requestOnce(key, requestId => invokeArtBatch(range, requestId), result => {
+          if (result.concept?.trim()) sharedConcept = result.concept;
+          if (result.palette?.length) sharedPalette = result.palette;
+          if (result.typography?.trim()) sharedTypography = result.typography;
+          for (const section of result.sections) sectionMap.set(section.sectionIndex, section);
+          persistArtDirectionDraft();
+        });
+        if (batchArt.concept?.trim()) sharedConcept = batchArt.concept;
+        if (batchArt.palette?.length) sharedPalette = batchArt.palette;
+        if (batchArt.typography?.trim()) sharedTypography = batchArt.typography;
+        for (const section of batchArt.sections) sectionMap.set(section.sectionIndex, section);
+      }
+      persistArtDirectionDraft();
+    }
+    const art = cp.artDirection!;
     const savedSections = await prisma.pageSection.findMany({ where: { projectId, sectionKey: { in: plan.sections.map((_, index) => `v4-${index}`) } }, orderBy: { order: "asc" } });
-    const artIssue = storyboardIssue(art.sections, expected);
+    const alignedArt = { ...art, sections: alignArtDirectionSections(art.sections, expected, planSectionHints) };
+    cp.artDirection = alignedArt;
+    const artIssue = storyboardIssue(alignedArt.sections, expected);
     if (artIssue) throw new InvalidStoryboard(artIssue);
-    art.sections.sort((a, b) => a.sectionIndex - b.sectionIndex);
-    const readableCopy = prepareReadableCopy(plan.sections, confirmedEstimates ? art.sections.map(cleanCustomerDirection) : art.sections);
-    const normalizedArt = { ...art, sections: readableCopy.sections.map((section) => ({ ...section, textBlocks: normalizeTypesetting(section.textBlocks as V4TextBlock[]) })) };
+    alignedArt.sections.sort((a, b) => a.sectionIndex - b.sectionIndex);
+    const readableCopy = prepareReadableCopy(plan.sections, confirmedEstimates ? alignedArt.sections.map(cleanCustomerDirection) : alignedArt.sections);
+    const normalizedArt = { ...alignedArt, sections: readableCopy.sections.map((section) => ({ ...section, textBlocks: normalizeTypesetting(section.textBlocks as V4TextBlock[]) })) };
     cp.artDirection = normalizedArt;
     cp.contentWarnings = [...new Set([...(cp.contentWarnings || []), ...readableCopy.warnings])];
     if (cp.lastError?.stage === "ART_DIRECTION") cp.lastError = undefined;
@@ -553,7 +786,7 @@ async function executeV4(runId: string) {
       progress.state = "generating"; await persist(`GENERATE:${section.title}`);
       try {
         await requestOnce(key, async requestId => {
-          const source = cp.requests![key].resultSource ?? await adapter.generateImageOnce({ model: section.type === "HERO" ? input.heroModelId || input.imageModelId : input.imageModelId, prompt: section.visualPrompt, quality: input.quality, background: settings.background, outputFormat: settings.outputFormat, outputCompression: settings.outputCompression, moderation: settings.moderation, ...(settings.size && settings.size !== "auto" ? { size: settings.size } : { aspectRatio: section.type === "HERO" ? "1:1" : "3:4" }), referenceImages: visualImages, timeoutMs: 180000, monitor: { projectId, sectionId: section.id, runId, operation: "v4_image_generation" },
+          const source = cp.requests![key].resultSource ?? await adapter.generateImageOnce({ model: section.type === "HERO" ? input.heroModelId || input.imageModelId : input.imageModelId, prompt: section.visualPrompt, quality: input.quality, background: settings.background, outputFormat: settings.outputFormat, outputCompression: settings.outputCompression, moderation: settings.moderation, ...(settings.size && settings.size !== "auto" ? { size: settings.size } : { aspectRatio: section.type === "HERO" ? "1:1" : "3:4" }), referenceImages: visualImages, timeoutMs: v4ImageGenerationTimeoutMs(provider.baseUrl), monitor: { projectId, sectionId: section.id, runId, operation: "v4_image_generation" },
             upstreamTask: cp.requests![key].upstreamTask,
             onUpstreamTask: async task => { cp.requests![key].upstreamTask = task; await persist(); },
             beforeSubmit: async () => { if (cp.recoverImagesOnly) throw new Error("仅恢复已有图片，禁止提交新的生图请求。"); await lease.assertActive(); },
@@ -573,11 +806,9 @@ async function executeV4(runId: string) {
     const hero = cp.images.find(i => sections.find(s => s.id === i.sectionId)?.type === "HERO");
     if (hero) await renderOne(hero, sections.find(s => s.id === hero.sectionId)!);
     const details = cp.images.filter(i => i !== hero && !i.assetId);
-    for (let index = 0; index < details.length; index += 2) {
+    for (const progress of details) {
       await lease.assertActive();
-      const results = await Promise.allSettled(details.slice(index, index + 2).map(i => renderOne(i, sections.find(s => s.id === i.sectionId)!)));
-      const failure = results.find(result => result.status === "rejected");
-      if (failure?.status === "rejected") throw failure.reason;
+      await renderOne(progress, sections.find(s => s.id === progress.sectionId)!);
     }
     await end("GENERATE");
     if (cp.recoverImagesOnly) {
@@ -653,7 +884,10 @@ async function executeV4(runId: string) {
       return;
     }
     cp.taskTiming = touchTiming(cp.taskTiming!, true);
-    cp.lastError = { stage: cp.stage, code: error instanceof InvalidStoryboard ? error.code : isStructuredSchemaRejection(error) ? "PROVIDER_SCHEMA_REJECTED" : isTimeout(error) ? "TIMEOUT" : "WORKFLOW_FAILED", message: requestErrorMessage(error, "当前步骤未完成，草稿和已生成的图片已保留。"), retryable: isStructuredSchemaRejection(error) };
+    const detailMessage = error instanceof Error && error.message.trim()
+      ? error.message.trim()
+      : requestErrorMessage(error, "当前步骤未完成，草稿和已生成的图片已保留。");
+    cp.lastError = { stage: cp.stage, code: error instanceof InvalidStoryboard ? error.code : isStructuredSchemaRejection(error) ? "PROVIDER_SCHEMA_REJECTED" : isTimeout(error) ? "TIMEOUT" : (error as { code?: string })?.code || "WORKFLOW_FAILED", message: detailMessage, retryable: isStructuredSchemaRejection(error) };
     await persistQueue.catch(() => undefined);
     try { await lease.transaction(async tx => { await tx.detailRun.update({ where: { id: runId }, data: { status: cp.images.some(i => i.assetId) ? "PARTIAL" : "FAILED", stage: `「${cp.stage}」阶段未完成，草稿已保留`, error: cp.lastError!.message, checkpoint: json(cp) } }); }); } catch (failure) { if (!(failure instanceof RunHalted)) throw failure; }
   } finally {

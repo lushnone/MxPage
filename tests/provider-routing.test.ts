@@ -324,6 +324,38 @@ test("Images generates and edits exact selected IDs with correct fields and one 
   await assert.rejects(ctx.adapter.editImage({ model: "image-B", prompt: "test", image })); assert.equal(calls.length, count + 1);
 });
 
+test("Bailian qwen-image sends reference images to /images/generations instead of /images/edits", async () => {
+  const { OpenAICompatibleAdapter } = await import("../lib/ai/adapters/openai-compatible");
+  const image = "data:image/png;base64,AA==";
+  const baseUrl = "https://ws-example.cn-beijing.maas.aliyuncs.com/compatible-mode/v1";
+  respond = () => Response.json({ data: [{ url: "https://images.test/bailian.png" }] });
+  const adapter = new OpenAICompatibleAdapter(baseUrl, "test-only");
+  await adapter.generateImageOnce({ model: "qwen-image-3.0-pro", prompt: "商品详情", referenceImages: [image, image] });
+  const last = calls.at(-1)!;
+  assert.ok(last.url.endsWith("/images/generations"));
+  assert.equal(last.body.image.length, 2);
+  assert.equal(last.body.model, "qwen-image-3.0-pro");
+});
+
+test("Token Plan qwen-image uses DashScope multimodal-generation for product refs + prompt", async () => {
+  const { OpenAICompatibleAdapter } = await import("../lib/ai/adapters/openai-compatible");
+  const image = "data:image/png;base64,AA==";
+  const baseUrl = "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1";
+  respond = () => Response.json({
+    output: { choices: [{ message: { content: [{ image: "https://images.test/token-plan.png" }] } }] },
+  });
+  const adapter = new OpenAICompatibleAdapter(baseUrl, "test-only");
+  await adapter.generateImageOnce({ model: "qwen-image-3.0-pro", prompt: "详情页主图", referenceImages: [image], aspectRatio: "3:4" });
+  const last = calls.at(-1)!;
+  assert.ok(last.url.endsWith("/api/v1/services/aigc/multimodal-generation/generation"));
+  const content = last.body.input.messages[0].content;
+  assert.equal(content[0].image, image);
+  assert.equal(content[1].text, "详情页主图");
+  assert.equal(last.body.parameters.size, "1024*1536");
+  assert.equal((await adapter.generateImageOnce({ model: "qwen-image-3.0-pro", prompt: "only text" })).url, "https://images.test/token-plan.png");
+  assert.equal(calls.at(-1)!.body.input.messages[0].content.length, 1);
+});
+
 test("EvoLink async adaptation leaves other models and all other origins on their original Images routes", async () => {
   const { OpenAICompatibleAdapter } = await import("../lib/ai/adapters/openai-compatible");
   const image = "data:image/png;base64,AA==";

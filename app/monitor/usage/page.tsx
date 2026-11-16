@@ -13,7 +13,7 @@ import { PageHeader } from "@/components/shared/page-header";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { prisma } from "@/lib/db/prisma";
-import { getApiUsageSummary, humanizeApiMonitorMessage, type ApiUsageEntry } from "@/lib/monitor/api-usage";
+import { formatMonitorOperation, getApiUsageSummary, humanizeApiMonitorMessage, type ApiUsageEntry } from "@/lib/monitor/api-usage";
 
 export const dynamic = "force-dynamic";
 
@@ -290,7 +290,7 @@ export default async function ApiUsageMonitorPage({
                   </div>
                   <div className="min-w-0">
                     <p className="text-muted-foreground">操作</p>
-                    <p className="break-all font-mono text-[13px] font-semibold leading-5">{entry.operation ?? "未标记"}</p>
+                    <p className="break-all font-mono text-[13px] font-semibold leading-5" title={entry.operation ?? undefined}>{formatMonitorOperation(entry.operation)}</p>
                   </div>
                   <div className="min-w-0">
                     <p className="text-muted-foreground">模型</p>
@@ -352,14 +352,34 @@ export default async function ApiUsageMonitorPage({
                   </div>
                 ) : null}
 
+                {entry.requestSummary && Object.keys(entry.requestSummary).length > 0 ? (
+                  <details className="mt-3 rounded-xl border border-border bg-muted/20 p-3 text-xs text-muted-foreground">
+                    <summary className="cursor-pointer">请求摘要（不含参考图 base64）</summary>
+                    <pre className="mt-2 max-h-40 overflow-auto whitespace-pre-wrap break-all font-mono text-[11px] leading-5">
+                      {JSON.stringify({ httpStatus: entry.statusCode, ...entry.requestSummary, providerErrorCode: entry.providerErrorCode ?? undefined }, null, 2)}
+                    </pre>
+                  </details>
+                ) : null}
+
                 {!entry.success && entry.errorMessage ? (
                   <>
                     <div className="mt-3 rounded-xl border border-rose-200 bg-rose-50 px-3 py-2 text-xs text-rose-700">
                       <p className="flex items-start gap-2">
                         <span className="mt-1 h-2 w-2 shrink-0 rounded-full bg-rose-500" />
-                        <span>{displayMonitorError(entry.errorMessage, entry.statusCode)}</span>
+                        <span>
+                          HTTP {entry.statusCode}
+                          {entry.providerErrorCode ? ` · ${entry.providerErrorCode}` : ""}
+                          {" · "}
+                          {displayMonitorError(entry.errorMessage, entry.statusCode)}
+                        </span>
                       </p>
                     </div>
+                    {entry.responseExcerpt ? (
+                      <details className="mt-3 rounded-xl border border-border bg-muted/30 p-3 text-xs text-muted-foreground">
+                        <summary className="cursor-pointer">失败时模型返回摘录（仅供排查）</summary>
+                        <pre className="mt-2 max-h-48 overflow-auto whitespace-pre-wrap break-all font-mono text-[11px] leading-5">{entry.responseExcerpt}</pre>
+                      </details>
+                    ) : null}
                     <p className="hidden">{displayMonitorError(entry.errorMessage, entry.statusCode)}</p>
                   </>
                 ) : null}

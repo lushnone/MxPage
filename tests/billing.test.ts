@@ -4,7 +4,7 @@ import { mkdtemp, readFile, writeFile, mkdir, rm } from "node:fs/promises";
 import path from "node:path";
 import { tmpdir } from "node:os";
 import { z } from "zod";
-import { billingFamily, calculateBilling, defaultBillingRules, readBillingRequest, readBillingUsage, readProviderCostUsd } from "../lib/monitor/billing";
+import { billingFamily, calculateBilling, defaultBillingRules, readBillingRequest, readBillingUsage, readProviderCostUsd, summarizeApiRequestBody } from "../lib/monitor/billing";
 
 const close = (actual: number | null | undefined, expected: number) => assert.ok(actual != null && Math.abs(actual - expected) < 1e-12, `${actual} != ${expected}`);
 const luna = { model: "gpt-6-luna", category: "chat", success: true };
@@ -43,6 +43,26 @@ test("reported amounts reject blank values and non-USD currencies", () => {
   assert.equal(readProviderCostUsd({ cost: 10, currency: "CNY", cost_usd: 1.4 }), 1.4);
   assert.equal(readProviderCostUsd({ usage: { total_cost: "0" } }), 0);
 });
+test("OpenAI-style JSON image refs count toward inputImages and request summary", () => {
+  const body = {
+    model: "qwen-image-3.0-pro",
+    prompt: "头图",
+    size: "1024x1024",
+    n: 1,
+    image: ["data:image/png;base64,AA==", "https://cdn.test/a.png"],
+  };
+  assert.equal(readBillingRequest(body).inputImages, 2);
+  assert.deepEqual(summarizeApiRequestBody(body), {
+    model: "qwen-image-3.0-pro",
+    promptChars: 2,
+    referenceImageCount: 2,
+    referenceImageBytes: body.image[0].length + body.image[1].length,
+    referenceImageKinds: ["data-url", "http-url"],
+    size: "1024x1024",
+    n: 1,
+  });
+});
+
 test("multipart records quality, size and image count without retaining prompt or base64", () => {
   const form = new FormData();
   form.set("prompt", "商品详情翻译 ACME"); form.set("quality", "low"); form.set("size", "1024x1024");

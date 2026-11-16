@@ -1,11 +1,19 @@
 import { z } from "zod";
 import { callText } from "./text-transport";
+import { isModelAccessDenied } from "@/lib/utils/request-error";
 import { nativePathPrefix, textProtocolOrder, type ResolvedTextSettings, type TextProtocol } from "./text-protocol";
 
 const probeImage = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAIAAAD8GO2jAAAACXBIWXMAAAPoAAAD6AG1e1JrAAAAMUlEQVRIie3QMQ0AAAjAMPybBgm7+FoDSzb7bASKRcmiZFGyKFmULEoWJYuSRel90QGLVfSmL9cHVAAAAABJRU5ErkJggg==";
 
 // Only definitive rejections can advance a lightweight probe. Never use this
 // negotiation loop for business requests or after an uncertain/accepted response.
+function probeRejectionKind(error: unknown): "endpoint" | "format" | "stream" | undefined {
+  // A completed HTTP response that cannot satisfy the probe schema is a definitive
+  // format mismatch, not an uncertain upstream outcome.
+  if (error instanceof z.ZodError || error instanceof SyntaxError) return "format";
+  return rejectionKind(error);
+}
+
 function rejectionKind(error: unknown): "endpoint" | "format" | "stream" | undefined {
   const e = error as { status?: number; code?: string; param?: string; message?: string };
   if (![400, 404, 405, 422, 501].includes(e.status || 0)) return;
@@ -19,27 +27,44 @@ function rejectionKind(error: unknown): "endpoint" | "format" | "stream" | undef
   if (/\bresponses\b|chat[\s_/]completions|\bmessages\b|generatecontent/.test(message)) return "endpoint";
 }
 
-export async function detectTextCompatibility(input: { baseUrl: string; apiKey: string; model: string; vision?: boolean }): Promise<ResolvedTextSettings> {
+export async function detectTextCompatibility(input: {
+  baseUrl: string; apiKey: string; model: string; vision?: boolean; monitorOperation?: string;
+}): Promise<ResolvedTextSettings> {
   const protocols = textProtocolOrder(input.baseUrl);
   const settingsFor = (protocol: TextProtocol): ResolvedTextSettings => {
     const prefix = nativePathPrefix(input.baseUrl, protocol);
     return { textProtocol: protocol, structuredOutputMode: "json_schema", ...(prefix ? { nativePathPrefix: prefix } : {}) };
   };
   let settings = settingsFor(protocols[0]);
+  try {
+    const host = new URL(input.baseUrl).hostname;
+    const bailian = /\.aliyuncs\.com$/i.test(host) || host.includes("dashscope");
+    if (bailian && protocols[0] === "chat_completions") {
+      settings = { textProtocol: "chat_completions", structuredOutputMode: "json_object" };
+    }
+    // DashScope compatible-mode VL models usually pair vision + json_object on Chat Completions.
+    if (input.vision && /vl/i.test(input.model) && bailian) {
+      settings = { textProtocol: "chat_completions", structuredOutputMode: "json_object" };
+    }
+  } catch { /* ignore invalid baseUrl during probe */ }
   const signal = AbortSignal.timeout(45000);
   // Bounded lightweight checks only. Existing cached configurations bypass this.
   for (let attempt = 0; attempt < 12; attempt++) {
     try {
       await callText({
-        ...input, ...settings, signal, timeoutMs: 15000, maxOutputTokens: 128,
+        ...input, ...settings, signal, timeoutMs: input.vision ? 30000 : 15000, maxOutputTokens: input.vision ? 256 : 128,
         system: "This is a connection test. Return only the requested JSON object.",
         input: 'Return {"status":"OK"}.', schema: z.object({ status: z.literal("OK") }),
         images: input.vision ? [probeImage] : undefined,
-        monitor: { operation: "provider_connection_probe" },
+        monitor: { operation: input.monitorOperation || "provider_connection_probe" },
       });
       return settings;
     } catch (error) {
-      const kind = rejectionKind(error);
+      if (isModelAccessDenied(error) && settings.structuredOutputMode !== "prompt_json") {
+        settings = { ...settings, structuredOutputMode: "prompt_json" };
+        continue;
+      }
+      const kind = probeRejectionKind(error);
       if (kind === "stream" && settings.textProtocol === "responses" && settings.responsesStream !== false) {
         settings = { ...settings, responsesStream: false };
       } else if (kind === "format" && settings.structuredOutputMode !== "prompt_json") {

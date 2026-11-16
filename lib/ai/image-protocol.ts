@@ -38,3 +38,36 @@ export function resolveImageProtocol(baseUrl: string): ImageProtocol {
 export function isImageEndpointError(error: unknown) {
   return (error as { code?: string })?.code === "IMAGE_ENDPOINT_UNAVAILABLE";
 }
+
+/** 百炼 OpenAI 兼容图像：参考图走 /images/generations 的 image 字段，官方不提供 /images/edits。 */
+export function isBailianImageCompatibleBase(baseUrl: string): boolean {
+  try {
+    const host = new URL(baseUrl).hostname.toLowerCase();
+    return /aliyuncs\.com$/.test(host) || host.includes("dashscope");
+  } catch {
+    return false;
+  }
+}
+
+export function bailianReferenceImageLimit(model: string): number {
+  return /qwen-image-3/i.test(model) ? 3 : 10;
+}
+
+/** Token Plan 个人/团队：生图走 DashScope multimodal-generation，不走 compatible /images。 */
+export function isTokenPlanImageBase(baseUrl: string): boolean {
+  try {
+    return new URL(baseUrl).hostname.toLowerCase().includes("token-plan");
+  } catch {
+    return false;
+  }
+}
+
+export function bailianDashScopeMultimodalGenerationUrl(baseUrl: string): string {
+  return `${new URL(baseUrl).origin}/api/v1/services/aigc/multimodal-generation/generation`;
+}
+
+/** OpenAI 兼容 size 用 x；DashScope parameters.size 用 *。 */
+export function dashScopeImageSize(openAiSize: string): string {
+  if (!openAiSize || openAiSize === "auto") return openAiSize;
+  return openAiSize.replace(/x/gi, "*");
+}

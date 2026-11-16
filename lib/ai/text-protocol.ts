@@ -10,7 +10,10 @@ export function nativePathPrefix(baseUrl: string, protocol: TextProtocol): Nativ
 export const textProtocols: TextProtocol[] = ["responses", "chat_completions", "anthropic_messages", "gemini_native"];
 export function textProtocolOrder(baseUrl: string): TextProtocol[] {
   const host = new URL(baseUrl).hostname;
-  const preferred = host === "api.anthropic.com" ? "anthropic_messages" : host === "generativelanguage.googleapis.com" ? "gemini_native" : "responses";
+  const preferred = host === "api.anthropic.com" ? "anthropic_messages"
+    : host === "generativelanguage.googleapis.com" ? "gemini_native"
+    : /\.aliyuncs\.com$/i.test(host) || host.includes("dashscope") ? "chat_completions"
+    : "responses";
   return [preferred, ...textProtocols.filter(protocol => protocol !== preferred)];
 }
 export type StructuredOutputMode = "json_schema" | "json_object" | "prompt_json";

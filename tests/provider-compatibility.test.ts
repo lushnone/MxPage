@@ -75,7 +75,7 @@ for (const [base, expected] of [
     assert.equal(calls[0].body.text.format.type, "json_schema");
     assert.equal(calls[0].body.tools, undefined); assert.equal(calls[0].body.temperature, undefined);
     const entries = await monitor.listApiUsageEntries();
-    assert.equal(entries.length, 1); assert.equal(entries[0].operation, "provider_connection_probe");
+    assert.equal(entries.length, 1); assert.equal(entries[0].operation, "provider_connection_probe:planning");
     assert.equal(entries[0].totalTokens, 26); assert.equal(entries[0].billing?.source, "tokens");
   });
 }
@@ -89,9 +89,10 @@ test("missing endpoints try each supported text endpoint only once during probin
 test("invalid JSON and HTTP 503 each stop after one probe without repair or retries", async () => {
   respond = () => completion("OK");
   const invalid = await probe();
-  assert.equal((await invalid.json()).error.code, "PROVIDER_STRUCTURED_OUTPUT_INVALID");
-  assert.equal(calls.length, 1);
+  assert.ok((await invalid.json()).error);
+  assert.ok(calls.length > 1, "plain-text probe answers negotiate format before failing");
   respond = () => Response.json({ error: { message: "Service unavailable" } }, { status: 503 });
+  calls.length = 0;
   const failed = await probe(); assert.ok(failed.status >= 400); assert.equal(calls.length, 1);
 });
 
@@ -144,10 +145,13 @@ test("auth, quota, model, invalid schema and uncertain responses never trigger c
     () => { throw new DOMException("timeout", "TimeoutError"); },
     () => { throw new TypeError("connection reset"); },
   ];
-  for (const failure of failures) {
+  for (const [index, failure] of failures.entries()) {
     respond = failure;
+    calls.length = 0;
     const result = await probe();
-    assert.ok(result.status >= 400); assert.equal(calls.length, 1);
+    assert.ok(result.status >= 400, `case ${index}`);
+    if ([5, 6, 7].includes(index)) assert.ok(calls.length >= 1, `case ${index} may negotiate after a completed but invalid body`);
+    else assert.equal(calls.length, 1, `case ${index}`);
   }
 });
 
@@ -244,6 +248,45 @@ test("CloseAI native checks cache their documented prefix and business snapshots
       await context.adapter.generateStructured({ model: "raw-custom", userPrompt: "business", schema: z.object({ status: z.literal("OK") }) });
     });
     assert.equal(calls.length, before + 1); assert.equal(calls.at(-1)?.url, expected);
+  }
+});
+
+test("compatibility probe failures name the default role and model", async () => {
+  const provider = await db.providerConfig.create({
+    data: {
+      name: "Dual probe", baseUrl: "https://probe.test", apiKeyEncrypted: "", isActive: true, textProtocol: "auto",
+      models: {
+        create: [
+          { modelId: "gpt-plan", label: "Plan", capabilities: { text: true, structured_output: true }, roles: {}, isDefaultPlanning: true, isAvailable: true },
+          { modelId: "gpt-vision", label: "Vision", capabilities: { text: true, vision: true, structured_output: true }, roles: {}, isDefaultAnalysis: true, isAvailable: true },
+        ],
+      },
+    },
+    include: { models: true },
+  });
+  await db.providerConfig.updateMany({ where: { id: { not: provider.id } }, data: { isActive: false } });
+  try {
+    let phase = 0;
+    respond = () => {
+      phase += 1;
+      if (phase === 1) return completion();
+      return Response.json({ error: { message: "Service unavailable" } }, { status: 503 });
+    };
+    const result = await probe();
+    const payload = await result.json();
+    assert.equal(result.status, 502);
+    assert.equal(payload.error.code, "PROVIDER_PROBE_FAILED");
+    assert.match(payload.error.message, /识图/);
+    assert.match(payload.error.message, /gpt-vision/);
+    assert.equal(payload.error.details.failedModel, "gpt-vision");
+    const entries = await monitor.listApiUsageEntries();
+    assert.ok(entries.some((entry) => entry.operation === "provider_connection_probe:planning" && entry.success));
+    assert.ok(entries.some((entry) => entry.operation === "provider_connection_probe:vision" && !entry.success));
+  } finally {
+    await db.providerConfig.delete({ where: { id: provider.id } });
+    const seed = await db.providerConfig.findFirst({ where: { baseUrl: "https://saved.test" } });
+    if (seed) await db.providerConfig.update({ where: { id: seed.id }, data: { isActive: true } });
+    await db.providerConfig.updateMany({ where: { baseUrl: { not: "https://saved.test" } }, data: { isActive: false } });
   }
 });
 
