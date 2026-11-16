@@ -12,6 +12,7 @@ test("native paths retain proxy prefixes and discovery resource IDs", () => {
   assert.equal(textEndpoint("https://provider.test/proxy/v2/", "anthropic_messages", "custom"), "https://provider.test/proxy/v2/messages");
   assert.equal(textProtocolOrder("https://api.anthropic.com")[0], "anthropic_messages");
   assert.equal(textProtocolOrder("https://generativelanguage.googleapis.com/v1beta")[0], "gemini_native");
+  assert.equal(textProtocolOrder("https://example.cn-beijing.maas.aliyuncs.com/compatible-mode/v1")[0], "chat_completions");
   assert.deepEqual(textHeaders("https://generativelanguage.googleapis.com", "gemini_native", "test"), { "x-goog-api-key": "test" });
   assert.equal(textHeaders("https://api.anthropic.com", "anthropic_messages", "test").Authorization, undefined);
   assert.equal(textHeaders("https://api.evolink.ai", "gemini_native", "test").Authorization, "Bearer test");

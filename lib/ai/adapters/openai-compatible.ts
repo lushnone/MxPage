@@ -1,7 +1,7 @@
 import { callText } from "@/lib/ai/text-transport";
 import { getRequestProviderCredentials } from "@/lib/services/provider-runtime";
 import { textEndpoint, normalizeOpenAiBaseUrl, type TextSettings } from "@/lib/ai/text-protocol";
-import { resolveImageModel, resolveImageProtocol, type ImageSettings } from "@/lib/ai/image-protocol";
+import { bailianDashScopeMultimodalGenerationUrl, bailianReferenceImageLimit, dashScopeImageSize, isBailianImageCompatibleBase, isTokenPlanImageBase, resolveImageModel, resolveImageProtocol, type ImageSettings } from "@/lib/ai/image-protocol";
 import { generateEvoLinkImage } from "./evolink-image";
 import { z } from "zod";
 
@@ -277,6 +277,21 @@ function extractImageResult(payload: {
     b64Json: result.b64_json ?? null,
     revisedPrompt: result.revised_prompt ?? null,
   };
+}
+
+function extractDashScopeImageResult(payload: {
+  output?: { choices?: Array<{ message?: { content?: Array<{ image?: string; text?: string }> } }> };
+  message?: string;
+  code?: string;
+}): ImageGenerationResult {
+  const parts = payload.output?.choices?.[0]?.message?.content ?? [];
+  for (const part of parts) {
+    if (typeof part?.image === "string" && part.image.trim()) {
+      return { url: part.image.trim(), b64Json: null, revisedPrompt: null };
+    }
+  }
+  const detail = payload.message || payload.code;
+  throw new Error(detail ? `Image request failed: ${detail}` : "Image generation returned no data.");
 }
 
 function extractGoogleImageResult(payload: any): ImageGenerationResult {
@@ -984,6 +999,57 @@ export class OpenAICompatibleAdapter implements ProviderAdapter {
       }), route.contract));
     }
     if (input.upstreamTask) throw new Error("此任务需要原异步图像协议，请切回任务原服务后继续。");
+    const images = input.referenceImages ?? [];
+    const bailianImage = isBailianImageCompatibleBase(this.baseUrl);
+    if (bailianImage && input.mask) throw new Error("百炼千问图像接口不支持蒙版编辑。");
+    if (bailianImage && isTokenPlanImageBase(this.baseUrl) && /qwen-image/i.test(input.model)) {
+      const refs = images.slice(0, bailianReferenceImageLimit(input.model));
+      const size = dashScopeImageSize(resolveOpenAiSize(input));
+      const content: Array<{ image: string } | { text: string }> = [
+        ...refs.map(image => ({ image })),
+        { text: input.prompt },
+      ];
+      await input.beforeSubmit?.();
+      const body = JSON.stringify({
+        model: input.model,
+        input: { messages: [{ role: "user", content }] },
+        parameters: {
+          n: 1,
+          ...(size && size !== "auto" ? { size } : {}),
+          prompt_extend: true,
+          watermark: false,
+        },
+      });
+      const endpoint = bailianDashScopeMultimodalGenerationUrl(this.baseUrl);
+      const response = await this.fetchRaw(endpoint, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body,
+        signal: input.signal,
+      }, undefined, input.timeoutMs ?? 180000, input.monitor, { model: input.model, protocol: "dashscope_multimodal" });
+      if (!response.ok) throw Object.assign(new Error(`Image request failed (${response.status}): ${response.body.slice(0, 1000)}`), { status: response.status, code: "IMAGE_REQUEST_FAILED" });
+      return success(extractDashScopeImageResult(JSON.parse(response.body)));
+    }
+    if (bailianImage && images.length) {
+      const refs = images.slice(0, bailianReferenceImageLimit(input.model));
+      await input.beforeSubmit?.();
+      const response = await this.requestRaw("/images/generations", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          model: input.model,
+          prompt: input.prompt,
+          size: resolveOpenAiSize(input),
+          n: 1,
+          ...(refs.length === 1 ? { image: refs[0] } : { image: refs }),
+        }),
+        signal: input.signal,
+      }, input.timeoutMs ?? 180000, input.monitor, { singleAttempt: true });
+      if (!response.ok) throw Object.assign(new Error(response.status === 404 || response.status === 405
+        ? `图像接口 /images/generations 不可用（${response.status}），请检查服务地址与图像模型。已暂停后续图片请求。`
+        : `Image request failed (${response.status}): ${response.body.slice(0, 1000)}`), { status: response.status, code: [404, 405].includes(response.status) ? "IMAGE_ENDPOINT_UNAVAILABLE" : "IMAGE_REQUEST_FAILED" });
+      return success(extractImageResult(JSON.parse(response.body)));
+    }
     const form = new FormData();
     if (input.mask) form.append("mask", dataUrlToBlob(input.mask), "mask.png");
     form.append("quality", input.quality ?? "auto");
@@ -994,7 +1060,6 @@ export class OpenAICompatibleAdapter implements ProviderAdapter {
     if (input.outputFormat) form.append("output_format", input.outputFormat);
     if (typeof input.outputCompression === "number" && input.outputFormat !== "png") form.append("output_compression", String(input.outputCompression));
     if (input.moderation) form.append("moderation", input.moderation);
-    const images = input.referenceImages ?? [];
     images.forEach((image, index) => form.append(images.length > 1 ? "image[]" : "image", dataUrlToBlob(image), `reference-${index}.png`));
     const path = `/images/${images.length ? "edits" : "generations"}`;
     const request = images.length

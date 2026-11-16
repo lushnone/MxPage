@@ -3,8 +3,23 @@ import { zodResponseFormat } from "openai/helpers/zod";
 import { logApiUsage } from "@/lib/monitor/api-usage";
 import { getRequestProviderCredentials } from "@/lib/services/provider-runtime";
 import type { AiMonitorContext } from "./provider-client";
+import { dashscopeStructuredRequestExtras } from "./dashscope-thinking";
 import { normalizeOpenAiBaseUrl, resolvedTextSettings, textEndpoint, type TextSettings } from "./text-protocol";
-import { nativeCompletion, nativeHeaders, nativeRequest, textHeaders } from "./native-text";
+import { nativeCompletion, nativeRequest, textHeaders } from "./native-text";
+
+export function chatAssistantText(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    return content
+      .map(part => {
+        if (!part || typeof part !== "object") return "";
+        const block = part as { type?: string; text?: string };
+        return block.type === "text" && typeof block.text === "string" ? block.text : "";
+      })
+      .join("");
+  }
+  return "";
+}
 export type TextCall = TextSettings & {
   apiKey: string; baseUrl: string; model: string; system: string; input: string;
   images?: string[]; schema?: z.ZodType; timeoutMs: number; requestId?: string;
@@ -25,9 +40,13 @@ export function buildTextRequest(input: TextCall) {
     input: [{ role: "user", content: [{ type: "input_text", text: input.input }, ...(input.images || []).map(url => ({ type: "input_image", image_url: url, detail: "high" }))] }],
     ...(input.schema && settings.structuredOutputMode !== "prompt_json" ? { text: { format: format ? { type: "json_schema", ...format.json_schema } : { type: "json_object" } } } : {}),
   };
-  return { model: input.model, ...(input.requestId ? { user: input.requestId } : {}),
+  return {
+    model: input.model,
+    ...(input.requestId ? { user: input.requestId } : {}),
+    ...(input.maxOutputTokens ? { max_tokens: input.maxOutputTokens } : {}),
     messages: [{ role: "system", content: system }, { role: "user", content: [{ type: "text", text: input.input }, ...(input.images || []).map(url => ({ type: "image_url", image_url: { url, detail: "high" } }))] }],
     ...(input.schema && settings.structuredOutputMode !== "prompt_json" ? { response_format: format || { type: "json_object" } } : {}),
+    ...dashscopeStructuredRequestExtras(input.baseUrl, input.model, !!input.schema),
   };
 }
 export function parseTextResponse(body: string, protocol: string) {
@@ -80,8 +99,14 @@ export function parseTextResponse(body: string, protocol: string) {
   if (protocol !== "responses" && ["length", "content_filter"].includes(payload.choices?.[0]?.finish_reason)) throw new Error("Provider returned incomplete text.");
   const text = protocol === "responses"
     ? (payload.output || []).flatMap((item: any) => item.content || []).filter((part: any) => part.type === "output_text").map((part: any) => part.text || "").join("") || payload.output_text || ""
-    : payload.choices?.[0]?.message?.content;
-  if (typeof text !== "string" || !text.trim()) throw new Error("Provider returned empty text or refused the request.");
+    : chatAssistantText(payload.choices?.[0]?.message?.content);
+  if (!text.trim()) {
+    const reasoning = payload.choices?.[0]?.message?.reasoning_content;
+    if (typeof reasoning === "string" && reasoning.trim()) {
+      throw new Error("模型把输出写进了思考字段，未返回可用的 JSON 正文。百炼混合思考模型做规划时请关闭思考（软件会自动处理），或改用 qwen-max / qwen-plus。");
+    }
+    throw new Error("Provider returned empty text or refused the request.");
+  }
   return { text, payload };
 }
 export async function callText(input: TextCall) {
@@ -93,10 +118,10 @@ export async function callText(input: TextCall) {
   const started = Date.now();
   const timeout = AbortSignal.timeout(input.timeoutMs);
   const signal = input.signal ? AbortSignal.any([timeout, input.signal]) : timeout;
-  let response: Response | undefined, body = "", payload: any, failure: unknown;
+  let response: Response | undefined, body = "", payload: any, failure: unknown, assistantText = "";
   const costReservation = await getRequestProviderCredentials().agentBeforeDispatch?.();
   try {
-    response = await fetch(endpoint, { method: "POST", redirect: "error", headers: { ...(input.monitor?.operation === "provider_connection_probe" ? { ...nativeHeaders("anthropic_messages", input.apiKey), ...nativeHeaders("gemini_native", input.apiKey) } : {}), ...textHeaders(input.baseUrl, protocol, input.apiKey), "Content-Type": "application/json", Accept: protocol === "responses" ? "text/event-stream, application/json" : "application/json" }, body: JSON.stringify(request), signal });
+    response = await fetch(endpoint, { method: "POST", redirect: "error", headers: { ...textHeaders(input.baseUrl, protocol, input.apiKey), "Content-Type": "application/json", Accept: protocol === "responses" ? "text/event-stream, application/json" : "application/json" }, body: JSON.stringify(request), signal });
     body = await response.text();
     if (!response.ok) {
       let upstream: { message?: string; code?: string; param?: string } = {};
@@ -107,23 +132,57 @@ export async function callText(input: TextCall) {
     }
     const result = parseTextResponse(body, protocol);
     payload = result.payload;
+    assistantText = result.text;
     const parsed = input.schema ? input.schema.parse(JSON.parse(result.text)) : undefined;
     return { text: result.text, parsed };
   } catch (error) {
+    if (!assistantText && body.trim()) {
+      try { assistantText = parseTextResponse(body, protocol).text; } catch { assistantText = body.slice(0, 4000); }
+    }
+    const details = structuredFailureMessage(error, assistantText);
     failure = timeout.aborted && !input.signal?.aborted
-      ? Object.assign(new Error(`模型响应等待超过 ${Math.ceil(input.timeoutMs / 1000)} 秒，尚未收到完整结果，当前步骤已暂停。请在任务详情中明确重试，可能产生额外费用。`), { name: "TimeoutError", code: "MODEL_RESPONSE_TIMEOUT" })
-      : error;
+      ? Object.assign(new Error(`模型响应等待超过 ${Math.ceil(input.timeoutMs / 1000)} 秒，尚未收到完整结果，当前步骤已暂停。${input.images?.length ? "多图规划或混合思考模型可能较慢，可改用 qwen-max / qwen-plus 作为规划默认。" : ""}请在任务详情中明确重试，可能产生额外费用。`), { name: "TimeoutError", code: "MODEL_RESPONSE_TIMEOUT" })
+      : details
+        ? Object.assign(error instanceof Error ? error : new Error(String(error)), { message: details })
+        : error;
     throw failure;
   }
   finally {
-    if (costReservation) await getRequestProviderCredentials().agentAfterDispatch?.(costReservation, { model: input.model, responseBody: payload ? JSON.stringify(payload) : body, requestBody: request, statusCode: response?.status || 0, success: !failure });
+    const httpOk = Boolean(response?.ok);
+    if (costReservation) await getRequestProviderCredentials().agentAfterDispatch?.(costReservation, { model: input.model, responseBody: payload ? JSON.stringify(payload) : body, requestBody: request, statusCode: response?.status || 0, success: httpOk && !failure });
     if (!input.suppressUsageLog) await logApiUsage({
       providerBaseUrl: baseUrl, endpoint, finalEndpoint: response?.url || endpoint, method: "POST", model: input.model,
       protocol, upstreamModel: typeof payload?.model === "string" ? payload.model : null,
       ...input.monitor, operation: input.monitor?.operation || "workflow_structured", category: "chat",
-      statusCode: response?.status || 0, durationMs: Date.now() - started, success: !failure,
+      statusCode: response?.status || 0, durationMs: Date.now() - started, success: httpOk && !failure,
       requestBytes: Buffer.byteLength(JSON.stringify(request)), responseBytes: Buffer.byteLength(body), requestBody: request,
-      responseBody: payload ? JSON.stringify(payload) : body, errorMessage: failure instanceof Error ? failure.message : null,
+      responseBody: payload ? JSON.stringify(payload) : body,
+      errorMessage: failure instanceof Error ? failure.message : null,
+      responseExcerpt: failure && (assistantText || body) ? (assistantText || body).slice(0, 4000) : null,
     }).catch(() => undefined);
   }
+}
+
+function structuredFailureMessage(error: unknown, assistantText: string) {
+  const excerpt = assistantText.trim().slice(0, 800);
+  const withExcerpt = (prefix: string) => (excerpt ? `${prefix} 模型返回摘录：${excerpt}` : prefix);
+  const trimmed = assistantText.trim();
+  const emptyObject = /^\{\s*\}$/.test(trimmed);
+  const emptyArray = /^\[\s*\]$/.test(trimmed);
+  if (error instanceof z.ZodError) {
+    const fields = error.issues.slice(0, 6).map(issue => {
+      const path = issue.path.map(part => (typeof part === "number" ? `[${part}]` : String(part))).join(".") || "root";
+      return `${path}: ${issue.code}`;
+    }).join("；");
+    const hint = emptyArray || (fields.startsWith("root: invalid_type") && emptyArray)
+      ? "模型返回了空数组 []，不是规划所需的 JSON 对象。百炼上请用 qwen3.8-max 或 qwen3.7-plus 作规划，并重启应用后重试 PLAN（已对该通道关闭思考输出）。"
+      : emptyObject
+        ? "模型正文是空对象 {}。请把规划默认改为 qwen3.8-max / qwen3.7-plus，或更新应用后重试 PLAN。"
+        : fields.startsWith("root: invalid_type")
+          ? "根节点不是 JSON 对象。请确认规划模型支持结构化输出，百炼推荐 qwen3.8-max 或 qwen3.7-plus。"
+          : "";
+    return withExcerpt(`结构化 JSON 校验失败（${fields}）。${hint ? ` ${hint}` : ""}`);
+  }
+  if (error instanceof SyntaxError) return withExcerpt("模型返回的内容不是合法 JSON。");
+  return undefined;
 }

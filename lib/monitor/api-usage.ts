@@ -2,7 +2,7 @@ import fs from "fs/promises";
 import path from "path";
 
 import { env } from "@/lib/utils/env";
-import { approximateTextTokens, calculateBilling, nonnegative, readBillingRequest, readBillingUsage, readProviderCostUsd, type BillingRecord, type BillingRequest, type BillingUsage } from "./billing";
+import { approximateTextTokens, calculateBilling, nonnegative, readBillingRequest, readBillingUsage, readProviderCostUsd, summarizeApiRequestBody, type ApiRequestSummary, type BillingRecord, type BillingRequest, type BillingUsage } from "./billing";
 import { getBillingRules } from "./billing-settings";
 import { readLastLines } from "./log-tail";
 import { buildUsageCharts } from "./usage-charts";
@@ -58,6 +58,11 @@ export interface ApiUsageEntry {
   }>;
   quotaState: "ok" | "rate_limited" | "spending_limited" | "auth_error" | "other_error";
   errorMessage: string | null;
+  /** Truncated model output saved only when success is false, for schema/network diagnosis. */
+  responseExcerpt?: string | null;
+  /** 不含 base64 的请求摘要，便于本地对照 status / response。 */
+  requestSummary?: ApiRequestSummary | null;
+  providerErrorCode?: string | null;
 }
 
 function tryParseJson(value: string) {
@@ -161,6 +166,10 @@ export function humanizeApiMonitorMessage(input: {
     return "请求已被中止，通常是超时控制或探测流程主动停止。";
   }
 
+  if (/url error|error-url|invalid_parameter_error/i.test(normalized) && /check url|图像|image/i.test(raw)) {
+    return "百炼 OpenAI 兼容 /images/generations 不支持当前参考图传参（url error）。Token Plan 需走 DashScope 图生图接口；请更新 MxPage 后重试，或生图服务改回 workspace 域名。";
+  }
+
   if (/no available endpoint found|get instance failed|real image generation endpoint/i.test(normalized)) {
     return "当前代理商没有为该模型提供可用端点，请更换模型或 Provider。";
   }
@@ -190,6 +199,14 @@ export function humanizeApiMonitorMessage(input: {
   }
 
   return raw;
+}
+
+export function formatMonitorOperation(operation: string | null | undefined) {
+  if (!operation) return "未标记";
+  if (operation === "provider_connection_probe") return "连接探测";
+  if (operation === "provider_connection_probe:planning") return "连接探测 · 规划（文本）";
+  if (operation === "provider_connection_probe:vision") return "连接探测 · 识图（视觉）";
+  return operation;
 }
 
 function humanizeRetrySummary(summary: string | null | undefined) {
@@ -296,6 +313,9 @@ export function inferCategory(endpoint: string, bodyPayload?: Record<string, unk
   if (endpointText.includes("/images/generations")) {
     return "image_generation";
   }
+  if (endpointText.includes("/multimodal-generation/generation")) {
+    return "image_generation";
+  }
   if (endpointText.includes("/chat/completions")) {
     return bodyPayload?.response_format ? "structured" : "chat";
   }
@@ -331,6 +351,7 @@ export async function logApiUsage(params: {
     errorMessage: string | null;
   }>;
   errorMessage?: string | null;
+  responseExcerpt?: string | null;
 }) {
   let parsedPayload: any = null;
   try {
@@ -379,6 +400,18 @@ export async function logApiUsage(params: {
     quotaState: params.success ? "ok" : classifyQuotaState(params.statusCode, params.responseBody),
     credentialFingerprint: providerCredentialFingerprint(getRequestProviderCredentials().apiKey),
     errorMessage: params.errorMessage ?? null,
+    requestSummary: summarizeApiRequestBody(params.requestBody),
+    providerErrorCode:
+      typeof parsedPayload?.error?.code === "string"
+        ? parsedPayload.error.code
+        : typeof parsedPayload?.code === "string"
+          ? parsedPayload.code
+          : null,
+    ...(!params.success
+      ? {
+          responseExcerpt: (params.responseExcerpt ?? params.responseBody).slice(0, 4000) || null,
+        }
+      : {}),
   };
   entry.billing = calculateBilling(entry, await getBillingRules());
 

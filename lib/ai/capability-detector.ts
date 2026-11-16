@@ -28,6 +28,16 @@ const emptyRoleMap = (): ModelRoleMap => ({
   image_edit: false,
 });
 
+/** 百炼 token-plan 控制台标「视觉理解」、/models 又不写 modalities 时的模型 ID。 */
+export function matchesBailianTextVisionModelId(modelId: string): boolean {
+  const id = modelId.toLowerCase().trim();
+  if (!id || /^(qwen|wan)[-_]?(image|audio|mt|tts|asr)/.test(id)) return false;
+  return /deepseek-v4\.1-flash(?:[-_/]|$)/.test(id)
+    || /^qwen3\.(?:6|7|8)-(?:flash|max)(?:[-_/]|$)/.test(id)
+    || /^qwen3\.7-plus(?:[-_/]|$)/.test(id)
+    || /^qwen4-max(?:[-_]preview)?(?:[-_/]|$)/.test(id);
+}
+
 function modelText(model: string | DetectedModelInput) {
   if (typeof model === "string") {
     return model.toLowerCase();
@@ -49,6 +59,17 @@ export function detectModelCapabilities(model: string | DetectedModelInput): Cap
   const id = (typeof model === "string" ? model : model.id).toLowerCase();
   const text = modelText(model);
   const map = emptyCapabilityMap();
+  if (typeof model !== "string") {
+    for (const modality of model.modalities ?? []) {
+      const entry = String(modality).toLowerCase();
+      if (entry === "image" || entry === "vision" || entry === "multimodal" || entry === "video") {
+        map.vision = true;
+        map.text = true;
+        map.structured_output = true;
+        break;
+      }
+    }
+  }
   const isGptImageModel = /(?:^|[-_/\s:])gpt[-_\s]?image(?:[-_\s]?(?:\d+(?:\.\d+)?|mini))?|chatgpt-image/.test(id);
   const isDallE2 = /dall[-_\s]?e[-_\s]?2/.test(id);
   const isImageTyped = /(^|\b)(image|images|image_generation|image-gen|image_gen)(\b|$)/.test(text);
@@ -68,6 +89,11 @@ export function detectModelCapabilities(model: string | DetectedModelInput): Cap
   }
 
   if (/(vision|vl|4o|omni|gemini|multimodal|qwen-vl|qvq|pixtral|llava|visual|claude-3|claude-sonnet|claude-opus|gpt-4\.1|gpt-[56])/.test(id) || isVisionTyped) {
+    map.vision = true;
+    map.text = true;
+    map.structured_output = true;
+  }
+  if (matchesBailianTextVisionModelId(id)) {
     map.vision = true;
     map.text = true;
     map.structured_output = true;

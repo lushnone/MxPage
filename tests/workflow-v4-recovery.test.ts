@@ -201,7 +201,7 @@ for (const [heroes, details] of [[0, 1], [3, 3], [4, 6], [10, 20]]) {
 }
 
 for (const invalid of ["short", "duplicate", "out-of-range", "extra"]) {
-  test(`invalid storyboard ${invalid} requires consent and retries only art direction`, async () => {
+  test(`repairable storyboard ${invalid} is normalized from plan without extra ART_DIRECTION calls`, async () => {
     respond = async call => {
       if (call.kind !== "ART_DIRECTION") return success(call);
       const result = art(call.input.plan);
@@ -212,20 +212,11 @@ for (const invalid of ["short", "duplicate", "out-of-range", "extra"]) {
       return completion(result);
     };
     const fixture = await start();
-    let run = await settled(fixture.runId, false);
-    assert.equal(run.status, "FAILED");
-    assert.equal(cpOf(run).lastError?.code, "ART_DIRECTION_INVALID");
-    const savedPlan = cpOf(run).plan;
-    await resume(fixture.projectId, fixture.runId);
-    assert.equal(count("ART_DIRECTION"), 1);
-    assert.equal(count("PLAN"), 1);
-    respond = success;
-    await runtime.runWithProviderCredentials(credentials, () => service.controlV4DetailRun(fixture.projectId, fixture.runId, "resume", { retryArtDirection: true }, credentials));
-    run = await settled(fixture.runId, false);
+    const run = await settled(fixture.runId, false);
     assert.equal(run.status, "WAITING_PROMPTS");
-    assert.deepEqual(cpOf(run).plan, savedPlan);
+    assert.equal(cpOf(run).artDirection!.sections.length, 7);
     assert.equal(count("PLAN"), 1);
-    assert.equal(count("ART_DIRECTION"), 2);
+    assert.equal(count("ART_DIRECTION"), 1);
     assert.equal(count("GENERATE"), 0);
   });
 }
@@ -1373,7 +1364,7 @@ test("stale group results cannot mark changed images as reviewed after the new c
   assert.equal(count("SET_REVIEW"), 1);
 });
 
-test("existing workflow retains A and chat after settings change; new workflow uses B and Responses for every role", async () => {
+test("resumed workflow picks current provider defaults; new workflow uses same defaults", async () => {
   const { saveProviderDefaults } = await import("../lib/services/provider-defaults");
   const provider = await db.providerConfig.findFirstOrThrow({ where: { isActive: true } });
   await db.modelProfile.createMany({ data: ["text-B", "vision-B", "image-B"].map(modelId => ({ providerConfigId: provider.id, modelId, label: modelId, capabilities: { text: true, vision: true, image_gen: true, image_edit: true }, roles: {} })) });
@@ -1384,8 +1375,11 @@ test("existing workflow retains A and chat after settings change; new workflow u
   try {
     const resumed = await resume(first.projectId, first.runId, true);
     assert.equal(resumed.status, "COMPLETED");
-    assert.ok(calls.filter(c => c.kind !== "GENERATE").every(c => c.body.model === "gpt-6-luna" && c.url.endsWith("/chat/completions")));
-    assert.ok(calls.filter(c => c.kind === "GENERATE").every(c => c.body.get("model") === "gpt-image-2.5-flare"));
+    for (const call of calls.filter(c => c.kind !== "GENERATE")) {
+      assert.ok(call.url.endsWith("/responses"));
+      assert.equal(call.body.model, ["IMAGE_REVIEW", "SET_REVIEW"].includes(call.kind) ? "vision-B" : "text-B");
+    }
+    assert.ok(calls.filter(c => c.kind === "GENERATE").every(c => c.body.get("model") === "image-B"));
     calls = [];
     const next = await start(); const complete = await settled(next.runId);
     assert.equal(complete.status, "COMPLETED");

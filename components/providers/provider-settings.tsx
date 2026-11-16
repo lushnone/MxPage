@@ -1,8 +1,10 @@
 "use client";
+import { matchesBailianTextVisionModelId } from "@/lib/ai/capability-detector";
 import { imageCapabilities } from "@/lib/ai/image-capabilities";
 import { normalizeOpenAiBaseUrl } from "@/lib/ai/text-protocol";
 import { ImageCapabilitySummary } from "./image-capability-controls";
 
+import { SearchSelect } from "@/components/ui/search-select";
 import { Select } from "@/components/ui/select";
 
 
@@ -101,7 +103,7 @@ const modelTypeFields: Array<{
     badgeClassName: "border-amber-200 bg-amber-100/70 text-amber-800 dark:border-amber-400/25 dark:bg-amber-400/10 dark:text-amber-200",
   },
   {
-    key: "image_edit", label: "图像编辑模型", icon: WandSparkles,
+    key: "image_edit", label: "图像编辑模型（可选）", icon: WandSparkles,
     panelClassName: "border-teal-200 bg-teal-50/60 dark:border-teal-400/30 dark:bg-teal-400/5",
     labelClassName: "text-teal-800 dark:text-teal-200",
     badgeClassName: "border-teal-200 bg-teal-100/70 text-teal-800 dark:border-teal-400/25 dark:bg-teal-400/10 dark:text-teal-200",
@@ -142,7 +144,10 @@ function isTextGenerationModel(model: GenericModelRecord) {
 }
 
 function isVisionModel(model: GenericModelRecord) {
-  return Boolean(model.capabilities?.vision) || /(vision|vl|4o|omni|multimodal|gpt-4\.1|gpt-5|qwen-vl|qvq|pixtral|visual)/.test(getModelText(model));
+  const modelId = String(model.modelId ?? "");
+  return Boolean(model.capabilities?.vision)
+    || matchesBailianTextVisionModelId(modelId)
+    || /(vision|vl|4o|omni|multimodal|gpt-4\.1|gpt-5|qwen-vl|qvq|pixtral|visual)/.test(getModelText(model));
 }
 
 function isImageGenerationModel(model: GenericModelRecord) {
@@ -202,6 +207,16 @@ function scoreModelForType(model: GenericModelRecord, typeKey: ModelTypeKey) {
 }
 
 function getModelsForType(models: GenericModelRecord[], typeKey: ModelTypeKey) {
+  if (typeKey === "image_edit") {
+    const dedicated = uniqueModels(models.filter((model) => canUseForModelType(model, typeKey)));
+    if (dedicated.length > 0) {
+      return dedicated.sort((left, right) => scoreModelForType(right, typeKey) - scoreModelForType(left, typeKey) || String(left.modelId).localeCompare(String(right.modelId)));
+    }
+    // 百炼等目录常不单独列出 edit；允许用 qwen-image / gpt-image 生图模型占位，真正改图时由服务端决定是否支持。
+    return uniqueModels(
+      models.filter((model) => isImageGenerationModel(model) && /^(qwen-image|gpt-image)/i.test(String(model.modelId ?? ""))),
+    ).sort((left, right) => scoreModelForType(right, typeKey) - scoreModelForType(left, typeKey) || String(left.modelId).localeCompare(String(right.modelId)));
+  }
   return uniqueModels(models.filter((model) => canUseForModelType(model, typeKey))).sort((left, right) => {
     const diff = scoreModelForType(right, typeKey) - scoreModelForType(left, typeKey);
     if (diff !== 0) return diff;
@@ -283,12 +298,18 @@ function readStoredCredentials() {
   }
 }
 
+function resolveApiKeyForService(formApiKey: string, baseUrl: string) {
+  const typed = formApiKey.trim();
+  if (typed) return typed;
+  const stored = readStoredCredentials();
+  return normalizeOpenAiBaseUrl(stored.baseUrl) === normalizeOpenAiBaseUrl(baseUrl) ? stored.apiKey : "";
+}
+
 function writeStoredCredentials(values: { apiKey: string; baseUrl: string }) {
   if (typeof window === "undefined") return;
-  window.localStorage.setItem(
-    CLIENT_PROVIDER_STORAGE_KEY,
-    JSON.stringify({ apiKey: values.apiKey.trim(), baseUrl: values.baseUrl.trim() }),
-  );
+  const baseUrl = values.baseUrl.trim();
+  const apiKey = resolveApiKeyForService(values.apiKey, baseUrl);
+  window.localStorage.setItem(CLIENT_PROVIDER_STORAGE_KEY, JSON.stringify({ apiKey, baseUrl }));
 }
 
 export function ProviderSettings({ initialProviders, runtimeConfig }: ProviderSettingsProps) {
@@ -302,7 +323,14 @@ export function ProviderSettings({ initialProviders, runtimeConfig }: ProviderSe
     [providers, selectedProviderId, activeProvider],
   );
   const [loading, setLoading] = useState<null | "configure" | "refreshModels" | "saveAsNew" | "activate" | "delete">(null);
-  const [probe, setProbe] = useState<{ status: "running" | "success" | "error"; message: string; endpoint?: string } | null>(null);
+  const [probe, setProbe] = useState<{
+    status: "running" | "success" | "error";
+    message: string;
+    endpoint?: string;
+    failedModel?: string;
+    failedRoleLabel?: string;
+    checkedModels?: Array<{ modelId: string; roleLabel: string; withVisionInput?: boolean }>;
+  } | null>(null);
   const [deleteTargetId, setDeleteTargetId] = useState("");
   const [models, setModels] = useState<Array<GenericModelRecord>>(selectedProvider?.models ?? []);
   const [defaults, setDefaults] = useState<DefaultAssignments>(buildDefaults(selectedProvider ?? null));
@@ -393,14 +421,20 @@ export function ProviderSettings({ initialProviders, runtimeConfig }: ProviderSe
   }
 
   function currentSubmitValues() {
+    const baseUrl = baseUrlLocked ? lockedBaseUrl : form.baseUrl.trim();
     return {
       id: form.id || undefined,
       name: form.name.trim() || "默认 GPT 模型服务",
-      baseUrl: baseUrlLocked ? lockedBaseUrl : form.baseUrl.trim(),
-      apiKey: form.apiKey.trim(),
+      baseUrl,
+      apiKey: resolveApiKeyForService(form.apiKey, baseUrl),
       isActive: true,
     };
   }
+
+  const configuredApiKey = useMemo(
+    () => resolveApiKeyForService(form.apiKey, baseUrlLocked ? lockedBaseUrl : form.baseUrl),
+    [form.apiKey, form.baseUrl, baseUrlLocked, lockedBaseUrl],
+  );
 
   function hydrateFromProviderPayload(data: any, nextSelectedId?: string | null) {
     window.dispatchEvent(new Event("mxpage:provider-updated"));
@@ -455,10 +489,17 @@ export function ProviderSettings({ initialProviders, runtimeConfig }: ProviderSe
     }
   }
 
+  function providerCredentialHeaders(values: Pick<ProviderSubmitValues, "apiKey" | "baseUrl">) {
+    const headers: Record<string, string> = { "Content-Type": "application/json" };
+    if (values.apiKey.trim()) headers["x-mxpage-api-key"] = values.apiKey.trim();
+    if (values.baseUrl.trim()) headers["x-mxpage-base-url"] = values.baseUrl.trim();
+    return headers;
+  }
+
   async function discoverProviderModels(values: ProviderSubmitValues) {
     const response = await fetch("/api/providers/discover-models", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: providerCredentialHeaders(values),
       body: JSON.stringify(values),
     });
     const payload = await response.json();
@@ -472,7 +513,7 @@ export function ProviderSettings({ initialProviders, runtimeConfig }: ProviderSe
   async function persistProviderConfig(values: ProviderSubmitValues, overwriteExisting: boolean, discoveredModels = models, recommendedDefaults = defaults) {
     const response = await fetch("/api/providers", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: providerCredentialHeaders(values),
       body: JSON.stringify({
         ...values,
         id: overwriteExisting ? values.id : undefined,
@@ -499,6 +540,7 @@ export function ProviderSettings({ initialProviders, runtimeConfig }: ProviderSe
       const values = !verifyConnection && selectedProvider && !selectedProvider.isActive
         ? { ...currentSubmitValues(), isActive: false }
         : currentSubmitValues();
+      writeStoredCredentials({ apiKey: values.apiKey, baseUrl: values.baseUrl });
       const { discoveredModels, recommendedDefaults } = await discoverProviderModels(values);
       // Refresh the catalogue without replacing the user's explicit choices.
       const sameService = values.baseUrl.replace(/\/+$/, "") === selectedProvider?.baseUrl.replace(/\/+$/, "");
@@ -516,16 +558,39 @@ export function ProviderSettings({ initialProviders, runtimeConfig }: ProviderSe
         return;
       }
       setProbe({ status: "running", message: "配置已保存，正在自动检查文本与识图模型的兼容性…" });
-      const response = await fetch("/api/providers/agent-compatibility", { method: "POST" });
+      const response = await fetch("/api/providers/agent-compatibility", {
+        method: "POST",
+        headers: providerCredentialHeaders(values),
+      });
       const payload = await response.json().catch(() => { throw new Error(`本地检测接口返回异常响应（HTTP ${response.status}），请刷新页面后重试。`); });
       endpoint = payload.data?.endpoint || payload.error?.details?.endpoint;
-      if (!response.ok || !payload.success) throw new Error(payload.error?.message || "模型连接检测失败");
-      setProbe({ status: "success", message: `探测通过：已发现 ${discoveredModels.length} 个模型并保存配置；已自动完成兼容检查。`, endpoint });
+      if (!response.ok || !payload.success) {
+        const err = new Error(payload.error?.message || "模型连接检测失败") as Error & { details?: unknown };
+        err.details = payload.error?.details;
+        throw err;
+      }
+      const checked = (payload.data?.checkedModels as Array<{ modelId: string; roleLabel: string; withVisionInput?: boolean }> | undefined) ?? [];
+      const checkedSummary = checked.length
+        ? `已检查：${checked.map((item) => `${item.roleLabel} · ${item.modelId}${item.withVisionInput ? "（含识图输入）" : ""}`).join("；")}。`
+        : "";
+      setProbe({
+        status: "success",
+        message: `探测通过：已发现 ${discoveredModels.length} 个模型并保存配置；${checkedSummary || "已自动完成兼容检查。"}`,
+        endpoint: payload.data?.endpoint,
+        checkedModels: checked,
+      });
       window.dispatchEvent(new Event("mxpage:provider-updated"));
       toast.success("探测通过，配置已保存");
     } catch (error) {
+      const details = (error as Error & { details?: { endpoint?: string; failedModel?: string; failedRoleLabel?: string } }).details;
       const message = `${saved ? "配置已保存，但模型连接检测未通过：" : verifyConnection ? "探测或保存失败：" : "模型列表刷新或保存失败："}${error instanceof Error ? error.message : "请稍后重试"}`;
-      setProbe({ status: "error", message, endpoint });
+      setProbe({
+        status: "error",
+        message,
+        endpoint: endpoint ?? details?.endpoint,
+        failedModel: details?.failedModel,
+        failedRoleLabel: details?.failedRoleLabel,
+      });
       toast.error(message);
     } finally {
       setLoading(null);
@@ -666,13 +731,13 @@ export function ProviderSettings({ initialProviders, runtimeConfig }: ProviderSe
                   一次完成模型发现、配置保存和自动兼容检查。连接检查使用少量文本/识图 token，不生成图片。
                 </p>
               </div>
-              <Button type="button" onClick={() => handleOneClickConfigure()} disabled={loading !== null || !form.apiKey.trim()} className="h-11 shrink-0 gap-2 px-5">
+              <Button type="button" onClick={() => handleOneClickConfigure()} disabled={loading !== null || !configuredApiKey} className="h-11 shrink-0 gap-2 px-5">
                 {loading === "configure" ? <Loader2 className="h-4 w-4 animate-spin" /> : <PlugZap className="h-4 w-4" />}
                 {loading === "configure" ? "正在探测…" : "探测并保存"}
               </Button>
             </div>
             <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
-              <Button type="button" variant="outline" onClick={() => handleOneClickConfigure(false)} disabled={loading !== null || !form.apiKey.trim()}>
+              <Button type="button" variant="outline" onClick={() => handleOneClickConfigure(false)} disabled={loading !== null || !configuredApiKey}>
                 {loading === "refreshModels" && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
                 {loading === "refreshModels" ? "正在读取列表…" : "仅刷新模型列表"}
               </Button>
@@ -680,11 +745,13 @@ export function ProviderSettings({ initialProviders, runtimeConfig }: ProviderSe
             </div>
             {probe && <div role="status" aria-live="polite" className={cn("space-y-1 rounded-xl border p-3 text-sm", probe.status === "error" ? "border-destructive/30 text-destructive" : probe.status === "success" ? "border-emerald-500/30 text-emerald-700 dark:text-emerald-300" : "text-muted-foreground")}>
               <p>{probe.message}</p>
+              {probe.failedModel && <p className="text-xs">失败项：{probe.failedRoleLabel ? `${probe.failedRoleLabel} · ` : ""}{probe.failedModel}</p>}
               {probe.endpoint && <p className="break-all text-xs text-muted-foreground">请求地址：{probe.endpoint}</p>}
+              {probe.status === "error" && <p className="text-xs text-muted-foreground">探测会各发一条极小的 chat 请求检查规划与识图默认模型；详情见 API 监控中 provider_connection_probe:planning 的状态码与上游原文。</p>}
             </div>}
             <div className="flex flex-wrap items-center justify-between gap-3 border-t border-border/70 pt-3">
               <p className="text-xs text-muted-foreground">需要保留当前历史服务时，可先一键配置确认模型，再另存为新服务。</p>
-              <Button type="button" variant="outline" onClick={saveProviderAsNew} disabled={loading !== null || models.length === 0 || !form.apiKey.trim()}>
+              <Button type="button" variant="outline" onClick={saveProviderAsNew} disabled={loading !== null || models.length === 0 || !configuredApiKey}>
                 {loading === "saveAsNew" ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <CopyPlus className="mr-2 h-4 w-4" />}
                 另存为新服务
               </Button>
@@ -712,12 +779,29 @@ export function ProviderSettings({ initialProviders, runtimeConfig }: ProviderSe
                         <Icon aria-hidden="true" className="h-4 w-4 shrink-0" />
                         {field.label}
                       </Label>
-                      <Select id={`default-model-${field.key}`} aria-label={field.label} value={selectedValue} disabled={loading !== null || options.length === 0} onValueChange={(value) => { changeDefault(field.key, value); }}>
-                        <option value="">{options.length === 0 ? "暂无此类型模型" : "未选择"}</option>
-                        {options.map((model) => (
-                          <option key={`${field.key}-${model.modelId}`} value={model.modelId}>{model.label}</option>
-                        ))}
-                      </Select>
+                      <SearchSelect
+                        id={`default-model-${field.key}`}
+                        aria-label={field.label}
+                        value={selectedValue}
+                        disabled={loading !== null || options.length === 0}
+                        emptyOptionLabel={options.length === 0 ? "暂无此类型模型" : field.key === "image_edit" ? "未选择（一键生成不需要）" : "未选择"}
+                        options={options.map((model) => ({ value: model.modelId, label: model.label }))}
+                        onValueChange={(value) => {
+                          changeDefault(field.key, value);
+                        }}
+                      />
+                      {field.key === "vision" && options.length === 0 && (
+                        <p className="text-xs leading-5 text-muted-foreground">
+                          若列表为空，请先点上方「仅刷新模型列表」。Token Plan 识图请选 qwen3.7-plus、qwen3.8-max、qwen3.8-flash 或 qwen3.6-flash（与客服清单一致，不是 qwen-image）。
+                        </p>
+                      )}
+                      {field.key === "image_edit" && (
+                        <p className="text-xs leading-5 text-muted-foreground">
+                          {options.length === 0
+                            ? "当前密钥的模型列表里没有专用修图模型。一键生成不需要；「按要求修改」需在百炼开通 qwen-image-edit 后刷新列表，或暂用上方生图同款（部分通道不支持改图）。"
+                            : "仅在工作台「按要求修改」时需要；规划、分镜与批量生图可不选。若无 qwen-image-edit，可先选与生图相同的 qwen-image-3.0-pro 占位。"}
+                        </p>
+                      )}
                       {field.key === "image_gen" && defaults.heroImageModelId !== defaults.detailImageModelId && (
                         <div className="space-y-2 text-xs leading-5">
                           <p>当前主图模型：{defaults.heroImageModelId || "未选择"}；详情图模型：{defaults.detailImageModelId || "未选择"}。此服务保留了不同的默认值。</p>
