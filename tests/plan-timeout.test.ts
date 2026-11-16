@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { planMaxOutputTokens, planRequestTimeoutMs, v4ImageGenerationTimeoutMs } from "@/lib/detail-runs/service-v4";
+import { imageGenerationTimeoutMs } from "@/lib/ai/image-protocol";
+import { planMaxOutputTokens, planRequestTimeoutMs } from "@/lib/detail-runs/service-v4";
 
 test("commerce plan timeout scales with screens and reference images", () => {
   const fourSixThree = planRequestTimeoutMs({ mode: "create", heroCount: 4, detailCount: 6 }, 3);
@@ -13,7 +14,7 @@ test("Bailian plan caps max output tokens at 8192", () => {
   assert.equal(planMaxOutputTokens("https://api.openai.com/v1"), 16_384);
 });
 
-test("Bailian image generation waits up to 10 minutes", () => {
-  assert.equal(v4ImageGenerationTimeoutMs("https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1"), 600_000);
-  assert.equal(v4ImageGenerationTimeoutMs("https://api.openai.com/v1"), 180_000);
+test("OpenAI-compatible MaaS image generation waits up to 10 minutes", () => {
+  assert.equal(imageGenerationTimeoutMs("https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1"), 600_000);
+  assert.equal(imageGenerationTimeoutMs("https://api.openai.com/v1"), 180_000);
 });

@@ -143,7 +143,7 @@ export async function runTranslationProject(options: {
           await transaction(async tx => { await tx.pageSection.update({ where: { id: image.sectionId }, data: { status: "GENERATING" } }); });
           if (lost || endpointUnavailable || !await options.active()) { image.status = "QUEUED"; if (!image.upstreamTask) image.attempts--; await save(); return; }
           sent = true;
-          const source = await adapter.generateImageOnce({ model: model.modelId, prompt, referenceImages: [`data:${sourceAsset.mimeType || "image/png"};base64,${bytes.toString("base64")}`], size: "auto", quality: options.quality, timeoutMs: 180000, monitor: { projectId, sectionId: image.sectionId, runId: id, operation: "translate_image" },
+          const source = await adapter.generateImageOnce({ model: model.modelId, prompt, referenceImages: [`data:${sourceAsset.mimeType || "image/png"};base64,${bytes.toString("base64")}`], size: "auto", quality: options.quality, monitor: { projectId, sectionId: image.sectionId, runId: id, operation: "translate_image" },
             upstreamTask: image.upstreamTask,
             onUpstreamTask: async task => { image.upstreamTask = task; await save(); },
             beforeSubmit: async () => {

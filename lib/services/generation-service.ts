@@ -1021,7 +1021,7 @@ export async function editSectionImage(
         metadata: { mode: "image_api", editMode, targetLanguage: editMode === "translate" ? effectiveContentLanguage : undefined, baseImageAssetId: section.currentImageAssetId, sourceReferenceAssetIds: productReferenceAssets.map(asset => asset.id) } });
       const generation = editMode === "translate" ? {
         model: selectedModel,
-        generated: await trackedImageRequest(task.id, () => adapter.generateImageOnce({ model: selectedModel, prompt, referenceImages: [baseImage], size: "auto", quality: generationSettings.quality, timeoutMs: 180000, monitor: { projectId, sectionId, operation: "translate_section_image" },
+        generated: await trackedImageRequest(task.id, () => adapter.generateImageOnce({ model: selectedModel, prompt, referenceImages: [baseImage], size: "auto", quality: generationSettings.quality, monitor: { projectId, sectionId, operation: "translate_section_image" },
           ...imageTaskLifecycle(task.id),
         })),
       } : await editWithFallback({

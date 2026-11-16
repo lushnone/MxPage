@@ -139,18 +139,34 @@ export function summarizeApiRequestBody(body: unknown): ApiRequestSummary {
     };
   }
   const value = body as Record<string, unknown>;
-  const refs = value.image == null ? [] : Array.isArray(value.image) ? value.image : [value.image];
+  const parameters = value.parameters as Record<string, unknown> | undefined;
+  const messageContent = (value.input as { messages?: Array<{ content?: unknown[] }> } | undefined)?.messages?.[0]?.content;
+  const multimodalParts = Array.isArray(messageContent) ? messageContent : [];
+  const multimodalImages = multimodalParts
+    .map((part) => (typeof part === "object" && part && "image" in part ? (part as { image?: string }).image : null))
+    .filter((item): item is string => typeof item === "string");
+  const multimodalPrompt = multimodalParts
+    .map((part) => (typeof part === "object" && part && "text" in part ? String((part as { text?: string }).text ?? "") : ""))
+  const promptFromMultimodal = multimodalPrompt.find((text) => text.length > 0);
+
+  const refs = value.image == null
+    ? multimodalImages
+    : Array.isArray(value.image) ? value.image : [value.image];
   const kinds = refs.map(classifyImageRef);
   const referenceImageBytes = refs.reduce((sum, item) => sum + (typeof item === "string" ? item.length : 0), 0);
+  const promptText = typeof value.prompt === "string" ? value.prompt : promptFromMultimodal;
+  const sizeValue = typeof value.size === "string"
+    ? value.size
+    : typeof parameters?.size === "string" ? parameters.size : undefined;
   return {
     model: typeof value.model === "string" ? value.model : undefined,
-    promptChars: typeof value.prompt === "string" ? value.prompt.length : undefined,
+    promptChars: promptText ? promptText.length : undefined,
     referenceImageCount: refs.length,
     referenceImageBytes: refs.length ? referenceImageBytes : undefined,
     referenceImageKinds: kinds.length ? kinds : undefined,
-    size: typeof value.size === "string" ? value.size : undefined,
+    size: sizeValue,
     quality: typeof value.quality === "string" ? value.quality : undefined,
-    n: nonnegative(value.n) ?? undefined,
+    n: nonnegative(value.n) ?? nonnegative(parameters?.n) ?? undefined,
   };
 }
 export function estimateImageOutputTokens(family: "image25" | "image2", quality: string, size: string) {

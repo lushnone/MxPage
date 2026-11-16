@@ -71,7 +71,7 @@ export async function queryImageTask(taskId: string) {
     let asset = assets.find(asset => record(asset.metadata).recoveryTaskId === taskId);
     if (!asset) {
       const result: ImageGenerationResult = await adapter.generateImageOnce({
-        model: recovery.model, prompt: recovery.prompt, upstreamTask: receipt, timeoutMs: 180000,
+        model: recovery.model, prompt: recovery.prompt, upstreamTask: receipt,
         monitor: { projectId: initial.projectId, sectionId: initial.sectionId ?? undefined, operation: "query_image_task" },
         onUpstreamTask: async upstreamImageTask => {
           await prisma.$transaction(async tx => { const { saved } = await owned(tx); await tx.generationTask.update({ where: { id: taskId }, data: { outputPayload: json({ ...saved, upstreamImageTask }) } }); });

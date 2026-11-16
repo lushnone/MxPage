@@ -139,14 +139,6 @@ export function artDirectionRequestTimeoutMs(sectionCount: number) {
   return Math.min(420_000, Math.max(180_000, 120_000 + sectionCount * 20_000));
 }
 
-/** Token Plan / 百炼 qwen-image 图生图常超过 3 分钟；客户端过早 abort 会标成「中断」而上游可能仍在跑。 */
-export function v4ImageGenerationTimeoutMs(baseUrl: string) {
-  try {
-    const host = new URL(baseUrl).hostname.toLowerCase();
-    if (/aliyuncs\.com$/.test(host) || host.includes("dashscope")) return 600_000;
-  } catch { /* ignore */ }
-  return 180_000;
-}
 function checksComplete(cp: V4Checkpoint) {
   return cp.images.length > 0 && cp.images.every(image => image.assetId && image.state === "checked" && image.check?.passed === true && !image.check.issues.some(issue => issue.severity === "error")) && cp.setReview?.passed === true && cp.setReview.issues.length === 0;
 }
@@ -786,7 +778,7 @@ async function executeV4(runId: string) {
       progress.state = "generating"; await persist(`GENERATE:${section.title}`);
       try {
         await requestOnce(key, async requestId => {
-          const source = cp.requests![key].resultSource ?? await adapter.generateImageOnce({ model: section.type === "HERO" ? input.heroModelId || input.imageModelId : input.imageModelId, prompt: section.visualPrompt, quality: input.quality, background: settings.background, outputFormat: settings.outputFormat, outputCompression: settings.outputCompression, moderation: settings.moderation, ...(settings.size && settings.size !== "auto" ? { size: settings.size } : { aspectRatio: section.type === "HERO" ? "1:1" : "3:4" }), referenceImages: visualImages, timeoutMs: v4ImageGenerationTimeoutMs(provider.baseUrl), monitor: { projectId, sectionId: section.id, runId, operation: "v4_image_generation" },
+          const source = cp.requests![key].resultSource ?? await adapter.generateImageOnce({ model: section.type === "HERO" ? input.heroModelId || input.imageModelId : input.imageModelId, prompt: section.visualPrompt, quality: input.quality, background: settings.background, outputFormat: settings.outputFormat, outputCompression: settings.outputCompression, moderation: settings.moderation, ...(settings.size && settings.size !== "auto" ? { size: settings.size } : { aspectRatio: section.type === "HERO" ? "1:1" : "3:4" }), referenceImages: visualImages, monitor: { projectId, sectionId: section.id, runId, operation: "v4_image_generation" },
             upstreamTask: cp.requests![key].upstreamTask,
             onUpstreamTask: async task => { cp.requests![key].upstreamTask = task; await persist(); },
             beforeSubmit: async () => { if (cp.recoverImagesOnly) throw new Error("仅恢复已有图片，禁止提交新的生图请求。"); await lease.assertActive(); },

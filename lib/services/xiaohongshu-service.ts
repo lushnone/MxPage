@@ -428,7 +428,6 @@ export async function generateXiaohongshuImages(
           prompt,
           aspectRatio: imageAspectRatio,
           referenceImages,
-          timeoutMs: 120000,
           monitor: {
             operation: "xiaohongshu_image_generate",
           },
@@ -497,7 +496,6 @@ export async function editXiaohongshuImage(input: {
         image: sourceImage,
         prompt,
         aspectRatio: imageAspectRatio,
-        timeoutMs: 120000,
         monitor: {
           operation: "xiaohongshu_image_edit",
         },

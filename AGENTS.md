@@ -64,6 +64,10 @@ Read this file first when working on the repository. Product facts and links are
 
 ## Testing and Windows edits
 
+- **Agents must not run tests unless the user explicitly asks in that conversation.**
+  This includes `npm test`, `npm run test:detail`, `npm run test:browser`, `npm run
+  test:all`, and any other test or regression script. Writing or updating tests is
+  fine; executing them is not, without the user's go-ahead.
 - Tests that import runtime services must set temporary `DATABASE_URL` / `STORAGE_ROOT`
   **before dynamic imports**. Assert isolation before writing or clearing a monitor.
   Never use the developer's real database, storage or paid provider in tests.

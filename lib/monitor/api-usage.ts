@@ -167,7 +167,7 @@ export function humanizeApiMonitorMessage(input: {
   }
 
   if (/url error|error-url|invalid_parameter_error/i.test(normalized) && /check url|图像|image/i.test(raw)) {
-    return "百炼 OpenAI 兼容 /images/generations 不支持当前参考图传参（url error）。Token Plan 需走 DashScope 图生图接口；请更新 MxPage 后重试，或生图服务改回 workspace 域名。";
+    return "图像请求地址或参考图参数不合规。Token Plan 生图不走 compatible-mode/images，请升级到已自动路由 multimodal 的版本；工作空间 MaaS 的 base_url 只填到 /compatible-mode/v1，勿重复粘贴 /images/generations。";
   }
 
   if (/no available endpoint found|get instance failed|real image generation endpoint/i.test(normalized)) {

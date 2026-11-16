@@ -1,7 +1,17 @@
 import { callText } from "@/lib/ai/text-transport";
 import { getRequestProviderCredentials } from "@/lib/services/provider-runtime";
 import { textEndpoint, normalizeOpenAiBaseUrl, type TextSettings } from "@/lib/ai/text-protocol";
-import { bailianDashScopeMultimodalGenerationUrl, bailianReferenceImageLimit, dashScopeImageSize, isBailianImageCompatibleBase, isTokenPlanImageBase, resolveImageModel, resolveImageProtocol, type ImageSettings } from "@/lib/ai/image-protocol";
+import {
+  imageGenerationTimeoutMs,
+  maasMultimodalImageUrl,
+  openAiImageSizeToDashScope,
+  openAiImagesJsonReferenceBase,
+  openAiImagesReferenceLimit,
+  resolveImageModel,
+  resolveImageProtocol,
+  usesMaasMultimodalImageEndpoint,
+  type ImageSettings,
+} from "@/lib/ai/image-protocol";
 import { generateEvoLinkImage } from "./evolink-image";
 import { z } from "zod";
 
@@ -279,19 +289,29 @@ function extractImageResult(payload: {
   };
 }
 
-function extractDashScopeImageResult(payload: {
-  output?: { choices?: Array<{ message?: { content?: Array<{ image?: string; text?: string }> } }> };
-  message?: string;
+type MaasMultimodalImagePayload = {
   code?: string;
-}): ImageGenerationResult {
-  const parts = payload.output?.choices?.[0]?.message?.content ?? [];
-  for (const part of parts) {
-    if (typeof part?.image === "string" && part.image.trim()) {
-      return { url: part.image.trim(), b64Json: null, revisedPrompt: null };
-    }
+  message?: string;
+  output?: {
+    choices?: Array<{
+      message?: {
+        content?: Array<{ image?: string }>;
+      };
+    }>;
+  };
+};
+
+function extractMaaSMultimodalImageResult(payload: MaasMultimodalImagePayload): ImageGenerationResult {
+  if (payload.code) {
+    throw new Error(payload.message || payload.code);
   }
-  const detail = payload.message || payload.code;
-  throw new Error(detail ? `Image request failed: ${detail}` : "Image generation returned no data.");
+
+  const imageUrl = payload.output?.choices?.[0]?.message?.content?.find((part) => part.image)?.image;
+  if (!imageUrl) {
+    throw new Error("图像服务未返回图片地址。");
+  }
+
+  return { url: imageUrl, b64Json: null, revisedPrompt: null };
 }
 
 function extractGoogleImageResult(payload: any): ImageGenerationResult {
@@ -1004,38 +1024,42 @@ export class OpenAICompatibleAdapter implements ProviderAdapter {
     }
     if (input.upstreamTask) throw new Error("此任务需要原异步图像协议，请切回任务原服务后继续。");
     const images = input.referenceImages ?? [];
-    const bailianImage = isBailianImageCompatibleBase(this.baseUrl);
-    if (bailianImage && input.mask) throw new Error("百炼千问图像接口不支持蒙版编辑。");
-    if (bailianImage && isTokenPlanImageBase(this.baseUrl) && /qwen-image/i.test(input.model)) {
-      const refs = images.slice(0, bailianReferenceImageLimit(input.model));
-      const size = dashScopeImageSize(resolveOpenAiSize(input));
-      const content: Array<{ image: string } | { text: string }> = [
-        ...refs.map(image => ({ image })),
-        { text: input.prompt },
-      ];
+    const imageTimeoutMs = input.timeoutMs ?? imageGenerationTimeoutMs(this.baseUrl);
+    if (usesMaasMultimodalImageEndpoint(this.baseUrl)) {
+      if (input.mask) throw new Error("Token Plan 图像接口不支持蒙版编辑。");
+      const refs = images.slice(0, openAiImagesReferenceLimit(input.model));
+      const content = [...refs.map((image) => ({ image })), { text: input.prompt }];
       await input.beforeSubmit?.();
-      const body = JSON.stringify({
-        model: input.model,
-        input: { messages: [{ role: "user", content }] },
-        parameters: {
-          n: 1,
-          ...(size && size !== "auto" ? { size } : {}),
-          prompt_extend: true,
-          watermark: false,
+      const response = await this.fetchRaw(
+        maasMultimodalImageUrl(this.baseUrl),
+        {
+          method: "POST",
+          body: JSON.stringify({
+            model: input.model,
+            input: { messages: [{ role: "user", content }] },
+            parameters: {
+              size: openAiImageSizeToDashScope(resolveOpenAiSize(input)),
+              n: 1,
+            },
+          }),
+          signal: input.signal,
         },
-      });
-      const endpoint = bailianDashScopeMultimodalGenerationUrl(this.baseUrl);
-      const response = await this.fetchRaw(endpoint, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body,
-        signal: input.signal,
-      }, undefined, input.timeoutMs ?? 180000, input.monitor, { model: input.model, protocol: "dashscope_multimodal" });
-      if (!response.ok) throw Object.assign(new Error(`Image request failed (${response.status}): ${response.body.slice(0, 1000)}`), { status: response.status, code: "IMAGE_REQUEST_FAILED" });
-      return success(extractDashScopeImageResult(JSON.parse(response.body)));
+        undefined,
+        imageTimeoutMs,
+        input.monitor,
+      );
+      if (!response.ok) {
+        throw Object.assign(
+          new Error(`Image request failed (${response.status}): ${response.body.slice(0, 1000)}`),
+          { status: response.status, code: "IMAGE_REQUEST_FAILED" },
+        );
+      }
+      return success(extractMaaSMultimodalImageResult(JSON.parse(response.body)));
     }
-    if (bailianImage && images.length) {
-      const refs = images.slice(0, bailianReferenceImageLimit(input.model));
+    const jsonRefsOnGenerations = openAiImagesJsonReferenceBase(this.baseUrl);
+    if (jsonRefsOnGenerations && input.mask) throw new Error("当前 OpenAI 兼容图像服务不支持蒙版编辑。");
+    if (jsonRefsOnGenerations && images.length) {
+      const refs = images.slice(0, openAiImagesReferenceLimit(input.model));
       await input.beforeSubmit?.();
       const response = await this.requestRaw("/images/generations", {
         method: "POST",
@@ -1048,7 +1072,7 @@ export class OpenAICompatibleAdapter implements ProviderAdapter {
           ...(refs.length === 1 ? { image: refs[0] } : { image: refs }),
         }),
         signal: input.signal,
-      }, input.timeoutMs ?? 180000, input.monitor, { singleAttempt: true });
+      }, imageTimeoutMs, input.monitor, { singleAttempt: true });
       if (!response.ok) throw Object.assign(new Error(response.status === 404 || response.status === 405
         ? `图像接口 /images/generations 不可用（${response.status}），请检查服务地址与图像模型。已暂停后续图片请求。`
         : `Image request failed (${response.status}): ${response.body.slice(0, 1000)}`), { status: response.status, code: [404, 405].includes(response.status) ? "IMAGE_ENDPOINT_UNAVAILABLE" : "IMAGE_REQUEST_FAILED" });
@@ -1075,7 +1099,7 @@ export class OpenAICompatibleAdapter implements ProviderAdapter {
           signal: input.signal,
         };
     await input.beforeSubmit?.();
-    const response = await this.requestRaw(path, request, input.timeoutMs ?? 180000, input.monitor, { singleAttempt: true });
+    const response = await this.requestRaw(path, request, imageTimeoutMs, input.monitor, { singleAttempt: true });
     if (!response.ok) throw Object.assign(new Error(response.status === 404 || response.status === 405
       ? `图像接口 ${path} 不可用（${response.status}），请检查服务地址与图像协议。已暂停后续图片请求。`
       : `Image request failed (${response.status}): ${response.body.slice(0, 1000)}`), { status: response.status, code: [404, 405].includes(response.status) ? "IMAGE_ENDPOINT_UNAVAILABLE" : "IMAGE_REQUEST_FAILED" });

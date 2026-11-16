@@ -39,22 +39,8 @@ export function isImageEndpointError(error: unknown) {
   return (error as { code?: string })?.code === "IMAGE_ENDPOINT_UNAVAILABLE";
 }
 
-/** 百炼 OpenAI 兼容图像：参考图走 /images/generations 的 image 字段，官方不提供 /images/edits。 */
-export function isBailianImageCompatibleBase(baseUrl: string): boolean {
-  try {
-    const host = new URL(baseUrl).hostname.toLowerCase();
-    return /aliyuncs\.com$/.test(host) || host.includes("dashscope");
-  } catch {
-    return false;
-  }
-}
-
-export function bailianReferenceImageLimit(model: string): number {
-  return /qwen-image-3/i.test(model) ? 3 : 10;
-}
-
-/** Token Plan 个人/团队：生图走 DashScope multimodal-generation，不走 compatible /images。 */
-export function isTokenPlanImageBase(baseUrl: string): boolean {
+/** Token Plan 订阅域：规划/对话走 compatible-mode，生图固定走 MaaS multimodal-generation（官方不含 OpenAI Images 路径）。 */
+export function usesMaasMultimodalImageEndpoint(baseUrl: string): boolean {
   try {
     return new URL(baseUrl).hostname.toLowerCase().includes("token-plan");
   } catch {
@@ -62,12 +48,36 @@ export function isTokenPlanImageBase(baseUrl: string): boolean {
   }
 }
 
-export function bailianDashScopeMultimodalGenerationUrl(baseUrl: string): string {
+export function maasMultimodalImageUrl(baseUrl: string): string {
   return `${new URL(baseUrl).origin}/api/v1/services/aigc/multimodal-generation/generation`;
 }
 
 /** OpenAI 兼容 size 用 x；DashScope parameters.size 用 *。 */
-export function dashScopeImageSize(openAiSize: string): string {
-  if (!openAiSize || openAiSize === "auto") return openAiSize;
-  return openAiSize.replace(/x/gi, "*");
+export function openAiImageSizeToDashScope(size: string): string {
+  if (!size || size === "auto") return size;
+  return size.replace(/x/gi, "*");
+}
+
+/** OpenAI 兼容 Images：部分 MaaS（如百炼 compatible-mode）有参考图时只认 /images/generations + JSON image，不提供 /images/edits。 */
+export function openAiImagesJsonReferenceBase(baseUrl: string): boolean {
+  try {
+    const host = new URL(baseUrl).hostname.toLowerCase();
+    if (usesMaasMultimodalImageEndpoint(baseUrl)) return false;
+    return /aliyuncs\.com$/.test(host) || host.includes("dashscope");
+  } catch {
+    return false;
+  }
+}
+
+export function openAiImagesReferenceLimit(model: string): number {
+  return /qwen-image-3/i.test(model) ? 3 : 10;
+}
+
+/** 全部生图/改图共用的客户端等待上限；仅按服务根地址区分慢通道，不散落在各业务模块。 */
+export function imageGenerationTimeoutMs(baseUrl: string): number {
+  try {
+    const host = new URL(baseUrl).hostname.toLowerCase();
+    if (/aliyuncs\.com$/.test(host) || host.includes("dashscope")) return 600_000;
+  } catch { /* ignore */ }
+  return 180_000;
 }

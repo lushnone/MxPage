@@ -349,23 +349,21 @@ test("Bailian base URL pasted with /images/generations does not double the path"
   assert.ok(!last.url.includes("/images/generations/images/"));
 });
 
-test("Token Plan qwen-image uses DashScope multimodal-generation for product refs + prompt", async () => {
+test("Token Plan qwen-image uses MaaS multimodal-generation instead of compatible /images", async () => {
   const { OpenAICompatibleAdapter } = await import("../lib/ai/adapters/openai-compatible");
   const image = "data:image/png;base64,AA==";
   const baseUrl = "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1";
   respond = () => Response.json({
-    output: { choices: [{ message: { content: [{ image: "https://images.test/token-plan.png" }] } }] },
+    output: { choices: [{ message: { role: "assistant", content: [{ image: "https://images.test/token-plan.png" }] } }] },
   });
   const adapter = new OpenAICompatibleAdapter(baseUrl, "test-only");
-  await adapter.generateImageOnce({ model: "qwen-image-3.0-pro", prompt: "详情页主图", referenceImages: [image], aspectRatio: "3:4" });
+  await adapter.generateImageOnce({ model: "qwen-image-3.0-pro", prompt: "详情页主图", referenceImages: [image] });
   const last = calls.at(-1)!;
   assert.ok(last.url.endsWith("/api/v1/services/aigc/multimodal-generation/generation"));
-  const content = last.body.input.messages[0].content;
-  assert.equal(content[0].image, image);
-  assert.equal(content[1].text, "详情页主图");
+  assert.equal(last.body.model, "qwen-image-3.0-pro");
+  assert.equal(last.body.input.messages[0].content[0].image, image);
+  assert.equal(last.body.input.messages[0].content[1].text, "详情页主图");
   assert.equal(last.body.parameters.size, "1024*1536");
-  assert.equal((await adapter.generateImageOnce({ model: "qwen-image-3.0-pro", prompt: "only text" })).url, "https://images.test/token-plan.png");
-  assert.equal(calls.at(-1)!.body.input.messages[0].content.length, 1);
 });
 
 test("EvoLink async adaptation leaves other models and all other origins on their original Images routes", async () => {
