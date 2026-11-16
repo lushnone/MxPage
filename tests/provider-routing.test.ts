@@ -337,6 +337,18 @@ test("Bailian qwen-image sends reference images to /images/generations instead o
   assert.equal(last.body.model, "qwen-image-3.0-pro");
 });
 
+test("Bailian base URL pasted with /images/generations does not double the path", async () => {
+  const { OpenAICompatibleAdapter } = await import("../lib/ai/adapters/openai-compatible");
+  const image = "data:image/png;base64,AA==";
+  const messyBase = "https://ws-example.cn-beijing.maas.aliyuncs.com/compatible-mode/v1/images/generations";
+  respond = () => Response.json({ data: [{ url: "https://images.test/bailian.png" }] });
+  const adapter = new OpenAICompatibleAdapter(messyBase, "test-only");
+  await adapter.generateImageOnce({ model: "qwen-image-3.0-pro", prompt: "商品详情", referenceImages: [image] });
+  const last = calls.at(-1)!;
+  assert.equal(last.url.match(/\/images\/generations/g)?.length, 1);
+  assert.ok(!last.url.includes("/images/generations/images/"));
+});
+
 test("Token Plan qwen-image uses DashScope multimodal-generation for product refs + prompt", async () => {
   const { OpenAICompatibleAdapter } = await import("../lib/ai/adapters/openai-compatible");
   const image = "data:image/png;base64,AA==";

@@ -24,6 +24,9 @@ function hasRealImageGeneration(model: ModelDetectionResult) {
 }
 
 function hasRealImageEdit(model: ModelDetectionResult) {
+  if (/qwen-image/i.test(model.modelId) && model.capabilities.image_gen && model.capabilities.real_image_edit !== false) {
+    return true;
+  }
   return model.capabilities.image_edit && model.capabilities.real_image_edit !== false;
 }
 
@@ -172,6 +175,6 @@ export function recommendDefaultModels(models: ModelDetectionResult[]) {
     planningModelId: planningModel?.modelId ?? null,
     heroImageModelId: heroImageModel?.modelId ?? null,
     detailImageModelId: detailImageModel?.modelId ?? null,
-    imageEditModelId: imageEditModel?.modelId ?? null,
+    imageEditModelId: imageEditModel?.modelId ?? (heroImageModel && /qwen-image/i.test(heroImageModel.modelId) ? heroImageModel.modelId : detailImageModel && /qwen-image/i.test(detailImageModel.modelId) ? detailImageModel.modelId : null) ?? null,
   };
 }

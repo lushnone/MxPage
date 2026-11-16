@@ -104,6 +104,12 @@ export function detectModelCapabilities(model: string | DetectedModelInput): Cap
     map.high_quality = true;
   }
 
+  // 百炼 qwen-image：文生图与「参考图 + 指令」改图同一模型，无单独 image-edit 产品名。
+  if (/qwen-image/i.test(id) && !isUtilityModel) {
+    map.image_gen = true;
+    map.image_edit = true;
+  }
+
   if (/(edit|inpaint|mask|kontext|retouch|erase|remove.?background)/.test(id) || isImageEditTyped) {
     map.image_edit = true;
   }

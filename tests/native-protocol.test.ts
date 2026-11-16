@@ -1,11 +1,27 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { nativeRequest, nativeCompletion, textHeaders } from "../lib/ai/native-text";
-import { nativePathPrefix, textEndpoint, textProtocolOrder } from "../lib/ai/text-protocol";
+import { nativePathPrefix, normalizeOpenAiBaseUrl, stripAccidentalApiPathSuffix, textEndpoint, textProtocolOrder } from "../lib/ai/text-protocol";
 import { NativeAgentModel } from "../lib/agent/native-model";
 import { HumanMessage, ToolMessage, mapChatMessagesToStoredMessages, mapStoredMessagesToChatMessages } from "@langchain/core/messages";
 import { tool } from "@langchain/core/tools";
 import { z } from "zod";
+
+test("stripAccidentalApiPathSuffix removes pasted OpenAI image/chat paths from provider base", () => {
+  const root = "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1";
+  assert.equal(
+    stripAccidentalApiPathSuffix(`${root}/images/generations`),
+    root,
+  );
+  assert.equal(
+    normalizeOpenAiBaseUrl(`${root}/images/generations/`),
+    root,
+  );
+  assert.equal(
+    normalizeOpenAiBaseUrl("https://api.openai.com/v1/chat/completions"),
+    "https://api.openai.com/v1",
+  );
+});
 
 test("native paths retain proxy prefixes and discovery resource IDs", () => {
   assert.equal(textEndpoint("https://provider.test/proxy/v1", "gemini_native", "models/custom-id"), "https://provider.test/proxy/v1beta/models/custom-id:generateContent");

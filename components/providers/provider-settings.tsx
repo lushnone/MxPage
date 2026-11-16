@@ -713,7 +713,8 @@ export function ProviderSettings({ initialProviders, runtimeConfig }: ProviderSe
             {!baseUrlLocked ? (
               <div className="space-y-2 md:col-span-2">
                 <Label htmlFor="provider-base-url">baseURL</Label>
-                <Input id="provider-base-url" disabled={loading !== null} inputMode="url" autoComplete="off" autoCapitalize="none" value={form.baseUrl} onChange={(event) => updateForm({ baseUrl: event.target.value })} placeholder="https://your-provider.example/v1" />
+                <Input id="provider-base-url" disabled={loading !== null} inputMode="url" autoComplete="off" autoCapitalize="none" value={form.baseUrl} onChange={(event) => updateForm({ baseUrl: event.target.value })} placeholder="https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1" />
+                <p className="text-xs text-muted-foreground">只填到 /compatible-mode/v1 或 /v1，不要包含 /images/generations、/chat/completions 等路径；保存时会自动去掉误粘贴的后缀。</p>
               </div>
             ) : null}
             <div className="space-y-2 md:col-span-2">

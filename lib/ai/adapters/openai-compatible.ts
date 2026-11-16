@@ -348,7 +348,11 @@ function classifyProbeResult(status: number, body: string) {
 export class OpenAICompatibleAdapter implements ProviderAdapter {
   private preferredBaseUrl: string | null = null;
 
-  constructor(private readonly baseUrl: string, private readonly apiKey: string, private readonly settings: TextSettings & ImageSettings = {}) {}
+  constructor(baseUrl: string, private readonly apiKey: string, private readonly settings: TextSettings & ImageSettings = {}) {
+    this.baseUrl = normalizeOpenAiBaseUrl(baseUrl);
+  }
+
+  private readonly baseUrl: string;
 
   private buildRequestUrls(path: string) {
     const urls = buildOpenAiCompatibleUrls(this.baseUrl, path);

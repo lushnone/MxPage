@@ -39,8 +39,30 @@ export function resolvedTextSettings(value: TextSettings, model: string): Resolv
   if (!resolved) throw new Error(`模型 ${model} 尚未完成自动连接检查，请重新探测服务后再试。`);
   return resolved;
 }
+/** 用户常把完整生图/聊天路径粘进 base_url，再拼接一次会触发百炼 url error。 */
+const TRAILING_API_PATH_SUFFIXES = [
+  /\/images\/generations$/i,
+  /\/images\/edits$/i,
+  /\/chat\/completions$/i,
+  /\/responses$/i,
+  /\/messages$/i,
+  /\/models$/i,
+];
+
+export function stripAccidentalApiPathSuffix(value: string) {
+  let base = value.trim().replace(/\/+$/, "");
+  for (let round = 0; round < 4; round++) {
+    const before = base;
+    for (const pattern of TRAILING_API_PATH_SUFFIXES) {
+      base = base.replace(pattern, "").replace(/\/+$/, "");
+    }
+    if (base === before) break;
+  }
+  return base;
+}
+
 export function normalizeOpenAiBaseUrl(value: string) {
-  const base = value.trim().replace(/\/+$/, "");
+  const base = stripAccidentalApiPathSuffix(value);
   return /\/v\d+(?:beta)?$/i.test(base) ? base : `${base}/v1`;
 }
 

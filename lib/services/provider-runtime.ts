@@ -2,6 +2,7 @@ import { AsyncLocalStorage } from "async_hooks";
 import { createHash } from "crypto";
 import type { NextRequest } from "next/server";
 
+import { normalizeOpenAiBaseUrl } from "@/lib/ai/text-protocol";
 import { env } from "@/lib/utils/env";
 
 export type RequestProviderCredentials = {
@@ -31,8 +32,8 @@ export function isBaseUrlLocked() {
 
 export function resolveEffectiveBaseUrl(baseUrl?: string | null) {
   const lockedBaseUrl = getLockedBaseUrl();
-  if (lockedBaseUrl) return lockedBaseUrl;
-  return normalizeBaseUrl(baseUrl);
+  if (lockedBaseUrl) return normalizeOpenAiBaseUrl(lockedBaseUrl);
+  return baseUrl ? normalizeOpenAiBaseUrl(normalizeBaseUrl(baseUrl)) : "";
 }
 
 export function readProviderCredentialsFromRequest(request: NextRequest): RequestProviderCredentials {
