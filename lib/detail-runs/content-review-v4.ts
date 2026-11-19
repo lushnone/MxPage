@@ -65,9 +65,11 @@ export function heroOnlyContentModules(plan: CoveragePlan) {
     && entry.sectionIndexes.every(index => plan.sections[index]?.kind === "HERO" && plan.sections[index].copy.trim()));
 }
 
+export type ContentCoverageOptions = { skipHeroToDetailMerge?: boolean };
+
 /** Coverage is advisory metadata. Carry existing copy into DETAIL when possible;
  * never invent missing content or stop paid work over labels/indices alone. */
-export function prepareContentCoverage<T extends CoveragePlan>(plan: T, placeContent = true) {
+export function prepareContentCoverage<T extends CoveragePlan>(plan: T, placeContent = true, options: ContentCoverageOptions = {}) {
   const warnings: string[] = [];
   const sections = plan.sections.map(section => ({ ...section, evidence: [...section.evidence] }));
   const contentCoverage: ContentCoverage = commerceContentModuleIds.map(module => {
@@ -91,6 +93,7 @@ export function prepareContentCoverage<T extends CoveragePlan>(plan: T, placeCon
     return entry;
   });
   for (const entry of heroOnlyContentModules({ sections, contentCoverage })) {
+    if (options.skipHeroToDetailMerge) continue;
     let placed = true;
     for (const sourceIndex of entry.sectionIndexes) {
       const source = sections[sourceIndex];

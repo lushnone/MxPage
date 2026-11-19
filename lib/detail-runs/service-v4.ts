@@ -16,7 +16,20 @@ import { detailRunInputSchema, socialPostSchema, type DetailRunInput } from "./c
 import { xhsImageCount } from "./xhs";
 import { createXhsPromptPack, withXhsVisualMaster, type XhsPromptPack } from "./xhs-rules";
 import { invokeStructured } from "./structured-model";
-import { InvalidStoryboard, storyboardIssue } from "./storyboard-validation";
+import { InvalidStoryboard, storyboardIssue, validateV4TextDensity } from "./storyboard-validation";
+import {
+  artDirectionSystemSuffix,
+  buildReferenceRolesPrefix,
+  identityAuthorityNote,
+  shouldSkipHeroToDetailMerge,
+} from "./visual-execution-policy";
+import {
+  fallbackVisualPreferenceBrief,
+  resolveTextStyle,
+  visualPreferenceBriefSchema,
+  visualPreferenceBriefSystem,
+  type VisualPreferenceBrief,
+} from "./visual-preference-brief";
 import { normalizeTypesetting, type V4TextBlock } from "./typesetting-v4";
 import { buildCommerceSystemPrompt } from "@/lib/ai/prompts/ecommerce-system";
 import { materializeImagePrompts } from "./image-prompts-v4";
@@ -43,6 +56,7 @@ export const V4_MAX_REQUEST_ATTEMPTS = 1;
 
 const REQUEST_STAGE_LABELS: Record<string, string> = {
   PLAN: "规划商品内容",
+  VISUAL_PREFERENCE: "整理视觉执行契约",
   ART_DIRECTION: "设计视觉分镜",
   INPUT_SUGGESTIONS: "推断商品补充选项",
   PREPARE: "准备商品资料",
@@ -97,6 +111,7 @@ export type V4Checkpoint = {
   confirmedSupplementalAnswers?: ReturnType<typeof resolveSupplementalSubmission>;
   supplementalQuestionIssue?: string;
   contentWarnings?: string[];
+  visualPreferenceBrief?: VisualPreferenceBrief;
 };
 
 async function projectForRun(projectId: string) {
@@ -314,11 +329,12 @@ export async function controlV4DetailRun(projectId: string, runId: string, actio
     if (!cp.plan || !(invalid || cp.lastError?.stage === "ART_DIRECTION")) throw new Error("当前没有可重试的失败分镜。");
     if (cp.images.some(image => image.assetId || image.state !== "pending") || Object.keys(cp.requests).some(key => key.startsWith("GENERATE:")) || cp.promptReview?.approvedAt) throw new Error("已确认提示词或已发起图片请求，不能重做分镜。");
     cp.artDirection = undefined;
+    cp.visualPreferenceBrief = undefined;
     const batchBaseUrl = resolveEffectiveBaseUrl((run.input as { providerSnapshot?: ProviderSnapshot }).providerSnapshot?.baseUrl);
     const artBatches = shouldBatchArtDirection(batchBaseUrl, expected)
       ? artDirectionBatchRanges(expected, artDirectionBatchSize(batchBaseUrl, expected))
       : [{ start: 0, end: expected }];
-    cp.retryAuthorized = artBatches.map(range => artDirectionRequestKey(range.start, range.end, expected));
+    cp.retryAuthorized = ["VISUAL_PREFERENCE", ...artBatches.map(range => artDirectionRequestKey(range.start, range.end, expected))];
     cp.promptReview = { revision: (cp.promptReview?.revision ?? 0) + 1, pages: [] };
   }
   if (action === "suggestions") {
@@ -346,7 +362,7 @@ export async function controlV4DetailRun(projectId: string, runId: string, actio
     cp.missingFields = undefined; cp.questions = undefined; cp.supplementalQuestionIssue = undefined;
     // A new answer changes the factual plan, so invalidate only downstream
     // planning artifacts; already generated images are not present here.
-    cp.plan = undefined; cp.artDirection = undefined; cp.images = []; cp.imageReviews = {}; cp.requests = {}; cp.retryAuthorized = []; cp.setReview = undefined; cp.setReviewGroups = {}; cp.setReviewAssetIds = undefined;
+    cp.plan = undefined; cp.artDirection = undefined; cp.visualPreferenceBrief = undefined; cp.images = []; cp.imageReviews = {}; cp.requests = {}; cp.retryAuthorized = []; cp.setReview = undefined; cp.setReviewGroups = {}; cp.setReviewAssetIds = undefined;
     cp.contentRepairRequested = undefined; cp.contentPlacements = undefined;
     cp.contentWarnings = undefined;
     if (cp.promptReview) cp.promptReview = { revision: cp.promptReview.revision + 1, pages: [] };
@@ -504,14 +520,15 @@ async function executeV4(runId: string) {
   };
   try {
     const current = await projectForRun(projectId);
-    const snapshot = current.modelSnapshot as { creativePreferences?: { userDirection?: string } } | null;
+    const snapshot = current.modelSnapshot as { creativePreferences?: { userDirection?: string }; creationBrief?: { name?: string } } | null;
     const userInstruction = input.instruction || snapshot?.creativePreferences?.userDirection || "";
+    const recognitionName = snapshot?.creationBrief?.name;
     const providerContext = await getProviderAdapter(input.providerSnapshot?.id, input.providerSnapshot, { legacyTextProtocol: !input.providerSnapshot });
     const { adapter, provider, apiKey } = providerContext;
     const { product: productImages, style: styleImages } = workflowReferenceAssets(current.assets);
     const images = await Promise.all(productImages.map(a => imageData(a.id, projectId)));
     const visualImages = [...images, ...await Promise.all(styleImages.map(a => imageData(a.id, projectId)))];
-    const referenceRoles = styleImages.length ? `参考图片按顺序：前${images.length}张是唯一商品身份与外观证据；其后${styleImages.length}张仅为风格参考，用于光线、色调、构图、细节放大和信息密度。风格参考中的文字、承诺、规格、商品结构不可作为事实或照抄；商品结构以原始商品图为准。` : "";
+    let referenceRoles = buildReferenceRolesPrefix(images.length, styleImages.length, cp.visualPreferenceBrief, userInstruction);
     await begin("PLAN");
     const description = input.xhsPromptPack?.brief ?? current.description;
     const evidenceCatalog = [
@@ -522,7 +539,13 @@ async function executeV4(runId: string) {
     const coverageRules = input.mode === "xhs" ? "小红书图文仅按用户主题与配图数量创作，不要求电商八类内容覆盖；contentCoverage返回空数组。" : input.detailCount === 0
       ? "用户选择0张详情图，只生成指定数量的HERO，不得补充DETAIL。contentCoverage可引用承载对应内容的HERO下标；超出主图范围的模块标记not_applicable并说明用户仅要求主图，不因缺少详情图而要求补充信息。"
       : `${input.heroCount === 0 ? "用户选择0张主图，只生成指定数量的DETAIL，不得补充HERO。\n" : ""}${contentCoverageInstructions}`;
-    const planInput = JSON.stringify({ productName: current.name, description, platform: current.platform, language: input.language, userInstruction, answers: cp.answers, confirmedSupplementalAnswers: cp.confirmedSupplementalAnswers, evidenceCatalog, requestedHeroCount: input.heroCount, requestedDetailCount: input.detailCount, sectionSlots, contentCoverageRules: coverageRules, supplementalInputRules: supplementalInputInstructions });
+    const identityAuthority = identityAuthorityNote(current.name, description || "", recognitionName);
+    const planInput = JSON.stringify({
+      productName: current.name, description, platform: current.platform, language: input.language, userInstruction,
+      identityAuthority, answers: cp.answers, confirmedSupplementalAnswers: cp.confirmedSupplementalAnswers, evidenceCatalog,
+      requestedHeroCount: input.heroCount, requestedDetailCount: input.detailCount, sectionSlots, contentCoverageRules: coverageRules,
+      supplementalInputRules: supplementalInputInstructions,
+    });
     const confirmedEstimates = cp.confirmedSupplementalAnswers?.some(answer => answer.basis === "model_estimate") === true;
     let plan = cp.plan;
     const requestPlanSchema: z.ZodType<WorkflowPlan> = input.mode === "xhs" ? xhsPlanSchema : planSchema;
@@ -564,7 +587,12 @@ async function executeV4(runId: string) {
     const imageRequestsStarted = cp.images.some(image => image.assetId || image.state !== "pending")
       || Object.keys(cp.requests).some(key => key.startsWith("GENERATE:"))
       || current.assets.some(asset => asset.type === "GENERATED" && (asset.metadata as { runId?: string } | null)?.runId === runId);
-    const content = input.mode === "xhs" ? { plan, warnings: [] } : prepareContentCoverage(plan, !cp.artDirection && !imageRequestsStarted);
+    const skipHeroMerge = shouldSkipHeroToDetailMerge(userInstruction, cp.visualPreferenceBrief);
+    const content = input.mode === "xhs" ? { plan, warnings: [] } : prepareContentCoverage(
+      plan,
+      !cp.artDirection && !imageRequestsStarted,
+      { skipHeroToDetailMerge: skipHeroMerge },
+    );
     plan = content.plan;
     cp.plan = plan;
     cp.contentWarnings = [...new Set([...(cp.contentWarnings || []), ...content.warnings, ...(auditLanguage ? ["部分文案含制作说明，请在预览中核对措辞。"] : [])])];
@@ -620,10 +648,56 @@ async function executeV4(runId: string) {
       });
     });
     await end("PLAN");
+    const expectedFrames = input.heroCount + input.detailCount;
+    if (input.mode !== "xhs" && expectedFrames > 0) {
+      const briefReady = cp.visualPreferenceBrief && cp.requests?.VISUAL_PREFERENCE?.state === "completed" && !cp.retryAuthorized?.includes("VISUAL_PREFERENCE");
+      if (!briefReady) {
+        await begin("VISUAL_PREFERENCE");
+        const briefInput = {
+          userInstruction,
+          requirements: plan.requirements || [],
+          productName: current.name,
+          description: description || "",
+          recognitionName,
+          identityAuthority,
+          sectionCount: expectedFrames,
+          planSectionTitles: plan.sections.map((section, index) => ({ sectionIndex: index, kind: section.kind, title: section.title })),
+        };
+        try {
+          await requestOnce("VISUAL_PREFERENCE", requestId => invokeStructured({
+            ...textSettings(input.providerSnapshot || {}),
+            apiKey,
+            baseUrl: provider.baseUrl,
+            model: input.planningModelId,
+            schema: visualPreferenceBriefSchema,
+            system: visualPreferenceBriefSystem,
+            input: JSON.stringify(briefInput),
+            images,
+            timeoutMs: 60000,
+            maxAttempts: 1,
+            requestId,
+            monitor: { projectId, runId, operation: "v4_visual_preference" },
+          }), result => { cp.visualPreferenceBrief = result; });
+        } catch {
+          cp.visualPreferenceBrief = fallbackVisualPreferenceBrief(briefInput);
+          cp.contentWarnings = [...new Set([...(cp.contentWarnings || []), "视觉执行契约模型请求未确认，已使用本地规则摘要作为生图约束。"])];
+          const prev = cp.requests?.VISUAL_PREFERENCE;
+          cp.requests!.VISUAL_PREFERENCE = { state: "completed", requestId: prev?.requestId || "fallback:visual-preference" };
+        }
+        await end("VISUAL_PREFERENCE");
+        if (cp.lastError?.stage === "VISUAL_PREFERENCE") cp.lastError = undefined;
+      }
+    }
+    referenceRoles = buildReferenceRolesPrefix(images.length, styleImages.length, cp.visualPreferenceBrief, userInstruction);
+    const textDensity = resolveTextStyle(cp.visualPreferenceBrief, userInstruction);
     await begin("ART_DIRECTION");
     const planSectionHints = plan.sections.map(section => ({ title: section.title, objective: section.objective, copy: section.copy, kind: section.kind }));
     type ArtDirectionResult = z.infer<typeof directionSchema>;
-    const artDirectionBaseSystem = input.xhsPromptPack?.artDirection || `${buildCommerceSystemPrompt(current.platform, ["hero_search", "feature_proof", "lifestyle", "material_closeup", "specification", "trust", "summary"])}\n${confirmedAnswerCopyRules}\n你是视觉分镜模型。只返回完整 JSON。根据完整内容任务设计每张图的构图、光线、场景、文字和信息模块，sectionIndex必须对应规划从0开始的下标。plan.sections[].copy 是内容基础，可以自然润色标题、调整句式、标点和换行，无需逐字复刻；保持完整买家信息、参数标签、数值、单位和尺寸表，不把完整页面简化成只有标题。不要删除页面，不要编造规格。每张最终prompt必须完整描述主体、镜头、环境、光线、配色、细节/信息模块与排版，最终可见文字以textBlocks为准；不能只写标题或依赖前一张图。按内容安排场景、微距、标注、信息图与规格表，避免所有页面同一背景加整件产品。`;
+    const artDirectionCore = input.xhsPromptPack?.artDirection || `${buildCommerceSystemPrompt(current.platform, ["hero_search", "feature_proof", "lifestyle", "material_closeup", "specification", "trust", "summary"])}\n${confirmedAnswerCopyRules}\n你是视觉分镜模型。只返回完整 JSON。根据完整内容任务设计每张图的构图、光线、场景、文字和信息模块，sectionIndex必须对应规划从0开始的下标。plan.sections[].copy 是内容基础，可以自然润色标题、调整句式、标点和换行，无需逐字复刻；保持完整买家信息、参数标签、数值、单位和尺寸表，不把完整页面简化成只有标题。不要删除页面，不要编造规格。每张最终prompt必须完整描述主体、镜头、环境、光线、配色、细节/信息模块与排版，最终可见文字以textBlocks为准；不能只写标题或依赖前一张图。按内容安排场景、微距、标注、信息图与规格表，避免所有页面同一背景加整件产品。`;
+    const artDirectionBaseSystem = textDensity === "minimal"
+      ? `${artDirectionCore}\n图内信息密度为 minimal：每张图 textBlocks 要少而精，HERO 最多 3 段、DETAIL 最多 5 段短句；优先摄影与场景，不要把规划全文塞进图内。`
+      : artDirectionCore;
+    const artDirectionBaseWithBrief = `${artDirectionBaseSystem}\n${artDirectionSystemSuffix(cp.visualPreferenceBrief, textDensity)}`;
     const artBatches = shouldBatchArtDirection(provider.baseUrl, expected)
       ? artDirectionBatchRanges(expected, artDirectionBatchSize(provider.baseUrl, expected))
       : [{ start: 0, end: expected }];
@@ -663,7 +737,7 @@ async function executeV4(runId: string) {
         baseUrl: provider.baseUrl,
         model: input.planningModelId,
         schema: batchSchema,
-        system: `${artDirectionBaseSystem}\n${batchHint}`,
+        system: `${artDirectionBaseWithBrief}\n${batchHint}`,
         input: JSON.stringify({
           plan,
           expectedSectionCount: batchCount,
@@ -674,6 +748,7 @@ async function executeV4(runId: string) {
           language: input.language,
           userInstruction,
           referenceRoles,
+          visualPreferenceBrief: cp.visualPreferenceBrief,
           brief: input.xhsPromptPack?.brief,
           sharedVisualDirection: { concept: sharedConcept, palette: sharedPalette, typography: sharedTypography },
         }),
@@ -718,6 +793,8 @@ async function executeV4(runId: string) {
     cp.artDirection = alignedArt;
     const artIssue = storyboardIssue(alignedArt.sections, expected);
     if (artIssue) throw new InvalidStoryboard(artIssue);
+    const densityIssue = validateV4TextDensity(alignedArt.sections, plan.sections, textDensity);
+    if (densityIssue) throw new InvalidStoryboard(densityIssue);
     alignedArt.sections.sort((a, b) => a.sectionIndex - b.sectionIndex);
     const readableCopy = prepareReadableCopy(plan.sections, confirmedEstimates ? alignedArt.sections.map(cleanCustomerDirection) : alignedArt.sections);
     const normalizedArt = { ...alignedArt, sections: readableCopy.sections.map((section) => ({ ...section, textBlocks: normalizeTypesetting(section.textBlocks as V4TextBlock[]) })) };
@@ -727,12 +804,37 @@ async function executeV4(runId: string) {
     const renderDirections = input.xhsPromptPack
       ? normalizedArt.sections.map(section => ({ ...section, prompt: withXhsVisualMaster(section.prompt, normalizedArt, input.xhsPromptPack!) }))
       : normalizedArt.sections;
-    const sections = materializeImagePrompts(savedSections, renderDirections, confirmedEstimates).map(section => ({ ...section, visualPrompt: referenceRoles ? `${referenceRoles}\n${section.visualPrompt}` : section.visualPrompt }));
+    const sectionKinds = plan.sections.map(section => section.kind);
+    const materialized = materializeImagePrompts(savedSections, renderDirections, confirmedEstimates, {
+      brief: cp.visualPreferenceBrief,
+      userInstruction,
+      sectionKinds,
+    });
+    const sections = materialized.map(section => ({
+      ...section,
+      visualPrompt: referenceRoles ? `${referenceRoles}\n${section.visualPrompt}` : section.visualPrompt,
+    }));
     if (cp.promptReview) {
-      if (!cp.promptReview.pages.length) cp.promptReview = { revision: cp.promptReview.revision + 1, pages: sections.map(section => ({ sectionId: section.id, title: section.title, kind: section.type === "HERO" ? "HERO" : "DETAIL", prompt: section.visualPrompt })) };
-      if (sections.length !== cp.promptReview.pages.length || sections.some((section, index) => section.id !== cp.promptReview!.pages[index].sectionId)) throw new PromptReviewConflict("页面列表与已保存提示词不一致，未发起图片请求。");
+      if (!cp.promptReview.pages.length) {
+        cp.promptReview = {
+          revision: cp.promptReview.revision + 1,
+          pages: sections.map(section => ({
+            sectionId: section.id,
+            title: section.title,
+            kind: section.type === "HERO" ? "HERO" : "DETAIL",
+            prompt: section.visualPrompt,
+          })),
+        };
+      }
+      if (sections.length !== cp.promptReview.pages.length || sections.some((section, index) => section.id !== cp.promptReview!.pages[index].sectionId)) {
+        throw new PromptReviewConflict("页面列表与已保存提示词不一致，未发起图片请求。");
+      }
       // Use the exact saved/approved string on every resume, never compile over user edits.
-      sections.forEach((section, index) => { section.visualPrompt = cp.promptReview!.pages[index].prompt; });
+      if (cp.promptReview.approvedAt) {
+        sections.forEach((section, index) => { section.visualPrompt = cp.promptReview!.pages[index].prompt; });
+      } else if (!cp.images.some(image => image.assetId)) {
+        sections.forEach((section, index) => { section.visualPrompt = cp.promptReview!.pages[index].prompt; });
+      }
     }
     await lease.transaction(async tx => { for (const section of sections) { await tx.pageSection.update({ where: { id: section.id }, data: { visualPrompt: section.visualPrompt, editableData: json({ ...(section.editableData as object || {}), workflowVersion: 4, artDirection: section.artDirection }) } }); } });
     const recoveredAssets = await prisma.productAsset.findMany({ where: { projectId, type: "GENERATED", sectionId: { in: sections.map(section => section.id) } }, orderBy: { createdAt: "desc" } });

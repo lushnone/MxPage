@@ -9,3 +9,5 @@ export function storyboardIssue(sections: Array<{ sectionIndex: number }>, expec
     return `视觉分镜页面下标必须完整且不重复，范围为 0–${expected - 1}。`;
   }
 }
+
+export { validateV4TextDensity } from "./visual-execution-policy";

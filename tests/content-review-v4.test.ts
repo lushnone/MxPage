@@ -39,6 +39,14 @@ test("coverage normalization preserves full content and evidence, merges duplica
   assert.deepEqual(prepareContentCoverage(fixed).plan, fixed, "Resume does not append content again");
 });
 
+test("minimal copy mode skips automatic hero-to-detail merge", () => {
+  const p = misplacedPlan();
+  const merged = prepareContentCoverage(p, true).plan;
+  const skipped = prepareContentCoverage(p, true, { skipHeroToDetailMerge: true }).plan;
+  assert.notDeepEqual(skipped.sections[2].copy, merged.sections[2].copy);
+  assert.equal(skipped.sections[2].copy, p.sections[2].copy);
+});
+
 test("overfull or already rendered pages keep their content and get advisory coverage notes", () => {
   for (const allowPlacement of [true, false]) {
     const p = misplacedPlan();

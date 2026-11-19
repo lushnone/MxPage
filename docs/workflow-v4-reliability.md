@@ -13,6 +13,13 @@
 - V4 模型调用关闭 SDK 自动重试与自动 JSON 修复；生图接口也不自动切换端点重发。已收到但格式无效的响应同样需要用户明确重试。
 - 仅 HTTP 400 且明确拒绝 `response_format` JSON Schema 的请求标记为 `rejected`，用户点击继续可重新提交；不会在当前执行中自动重发。网络错误、5xx、无效返回 JSON 等仍为 `uncertain`，继续遵守计费重试确认。
 
+## 视觉执行契约（创意偏好 → 生图）
+
+- PLAN 完成后、视觉分镜前执行一次 `VISUAL_PREFERENCE` 结构化请求（与规划同级文本模型），将创意偏好、`plan.requirements` 与商品叙事整理为 `checkpoint.visualPreferenceBrief`；失败时使用本地规则摘要，不阻塞流程。
+- 编译每页 `visualPrompt` 时由代码固定追加 `User visual contract` 段（全局约束、参考图用法、禁止出现的品牌字、按屏 hint），与 Exact copy 同级；不依赖分镜模型是否「记住」用户偏好。
+- `promptReview.approvedAt` 之后 resume 仍只使用已保存/已确认的提示词原文，不静默改写；重做分镜会清空 `promptReview.pages` 并重新生成 brief 与分镜。
+- 图内 `minimal` 密度时程序跳过头图向详情的自动灌字，并在 materialize 阶段截断 Exact copy 行数；分镜 textBlocks 超出上限时仅允许「重试视觉分镜」，规划保留。
+
 ## 文案与内容覆盖容错
 
 - 新规划传入全套页面编号及 HERO/DETAIL 槽位，覆盖记录使用全套从 0 开始的下标。

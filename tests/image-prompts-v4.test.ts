@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { materializeImagePrompts } from "../lib/detail-runs/image-prompts-v4";
+import { fallbackVisualPreferenceBrief } from "../lib/detail-runs/visual-preference-brief";
 
 test("paid image input uses finalized art direction and exact copy, not an earlier planning prompt", () => {
   const savedBeforeArt = [{ id: "hero", order: 0, visualPrompt: "stale planning objective" }];
@@ -18,6 +19,25 @@ test("out-of-order storyboard entries bind to the matching section index", () =>
   ]);
   assert.match(output[0].visualPrompt, /^Hero composition/);
   assert.match(output[1].visualPrompt, /^Detail closeup/);
+});
+
+test("visual preference brief is injected before exact copy", () => {
+  const brief = fallbackVisualPreferenceBrief({
+    userInstruction: "不要 logo\n不要太多字",
+    requirements: ["禁止品牌 Logo"],
+    productName: "商品",
+    description: "",
+    sectionCount: 1,
+  });
+  const [out] = materializeImagePrompts(
+    [{ order: 0, visualPrompt: "", type: "HERO" }],
+    [{ sectionIndex: 0, prompt: "Bedroom scene", textBlocks: [{ text: "标题", role: "title" }, { text: "副句一" }, { text: "副句二" }, { text: "多余" }] }],
+    false,
+    { brief, userInstruction: "不要太多字", sectionKinds: ["HERO"] },
+  );
+  assert.match(out.visualPrompt, /User visual contract/);
+  const exact = out.visualPrompt.split("Exact copy:\n")[1] || "";
+  assert.ok(!exact.includes("多余"));
 });
 
 test("duplicate or missing storyboard indices stop before paid requests", () => {
