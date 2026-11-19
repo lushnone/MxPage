@@ -72,3 +72,5 @@ Private.md
 /ui-review/
 /.bg-*.txt
 /scripts/*acceptance.mjs
+
+.next-test-resolve

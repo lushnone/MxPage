@@ -13,7 +13,7 @@ async function main() {
     const index = args.findIndex(arg => arg === long || arg === short);
     return index >= 0 ? args[index + 1] : args.find(arg => arg.startsWith(`${long}=`))?.slice(long.length + 1);
   };
-  const port = Number(argument("--port", "-p") || process.env.PORT || 3000);
+  const port = Number(argument("--port", "-p") || process.env.PORT || 3001);
   const host = argument("--hostname", "-H") || "127.0.0.1";
   if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error("Invalid port.");
   const probeHost = ["0.0.0.0", "::"].includes(host) ? "127.0.0.1" : host;

@@ -9,7 +9,7 @@ import { stitchDetailImages } from "../lib/detail-runs/long-image";
 async function main() {
   const [projectId, outputDirectory] = process.argv.slice(2);
   assert.ok(projectId && outputDirectory, "Usage: tsx tests/verify-live-detail-export.ts PROJECT_ID OUTPUT_DIRECTORY");
-  const base = `http://127.0.0.1:3000/api/projects/${encodeURIComponent(projectId)}`;
+  const base = `http://127.0.0.1:3001/api/projects/${encodeURIComponent(projectId)}`;
   const runPayload = await (await fetch(`${base}/detail-runs`)).json();
   const projectPayload = await (await fetch(base)).json();
   assert.equal(runPayload.success, true); assert.equal(projectPayload.success, true);

@@ -203,9 +203,9 @@ npm run docs:sync
 npm run dev
 ```
 
-访问 `http://localhost:3000`。默认数据库位于 `prisma/dev.db`，图片和日志位于 `storage/`。生产运行使用 `npm run build`、`npm start`；先停止占用同一 `.next` 的开发服务。桌面构建使用独立 `.next-desktop`。
+访问 `http://localhost:3001`。默认数据库位于 `prisma/dev.db`，图片和日志位于 `storage/`。生产运行使用 `npm run build`、`npm start`；先停止占用同一 `.next` 的开发服务。桌面构建使用独立 `.next-desktop`。
 
-重复执行启动命令会复用同项目的服务；其他程序占用端口时明确报错，不自动换端口、不清理缓存。默认监听 `127.0.0.1:3000`，可显式传入 `--hostname` / `--port`。翻译上传断点保存在当前浏览器的 IndexedDB 中，清除站点数据会移除尚未提交的本地草稿。
+重复执行启动命令会复用同项目的服务；其他程序占用端口时明确报错，不自动换端口、不清理缓存。默认监听 `127.0.0.1:3001`，可显式传入 `--hostname` / `--port`。翻译上传断点保存在当前浏览器的 IndexedDB 中，清除站点数据会移除尚未提交的本地草稿。
 
 | 配置 | 用途 |
 | --- | --- |

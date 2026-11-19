@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { buildSupplementalSubmission, incompleteSupplementalEstimates, missingFieldSchema, normalizeSupplementalQuestions, resolveSupplementalSubmission, supplementalQuestionSetId, supplementalQuestionsFromFields, supplementalQuestionsReady, supplementalQuestionIssues } from "../lib/detail-runs/supplemental-input";
+import { buildSupplementalSubmission, incompleteSupplementalEstimates, missingFieldSchema, normalizeSupplementalQuestions, normalizeSupplementalSuggestionsPayload, resolveSupplementalSubmission, supplementalQuestionSetId, supplementalQuestionsFromFields, supplementalQuestionsReady, supplementalQuestionIssues, supplementalSuggestionsSchema } from "../lib/detail-runs/supplemental-input";
 
 const fields = [
   { field: "material", question: "商品材质是什么？", blocking: true, options: ["陶瓷", "玻璃", "不锈钢"] },
@@ -9,6 +9,15 @@ const fields = [
 ];
 const questions = supplementalQuestionsFromFields(fields);
 const selected = () => Object.fromEntries(questions.map(question => [question.id, { mode: "option" as const, optionIndex: 0, customText: "未选中的旧填空，不能采用" }]));
+
+test("supplemental suggestion schema accepts array-wrapped or bare question-list model payloads", () => {
+  const question = { text: "主规格？", fields: ["尺寸规格与填充重量"], options: ["约 200×230 cm、1.5 kg", "约 220×240 cm、2.0 kg", "约 150×200 cm、1.0 kg"] };
+  const wrapped = normalizeSupplementalSuggestionsPayload([{ questions: [question, question, question] }]);
+  assert.deepEqual(wrapped, { questions: [question, question, question] });
+  const bareList = normalizeSupplementalSuggestionsPayload([question, question, question]);
+  assert.deepEqual(bareList, { questions: [question, question, question] });
+  assert.equal(supplementalSuggestionsSchema.safeParse([{ questions: [question, question, question] }]).success, true);
+});
 
 test("only concrete model options are used; old or generic options are not padded with canned answers", () => {
   assert.equal(questions.length, 3);

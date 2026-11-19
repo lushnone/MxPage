@@ -53,11 +53,28 @@ export function incompleteSupplementalEstimates(answers: Array<{ question: strin
   return answers.filter(answer => answer.source === "option" && quantitativeOptionIssue({ text: answer.question, fields: answer.fields, options: [answer.answer] }));
 }
 
-export const supplementalSuggestionsSchema = z.object({ questions: z.array(z.object({
+const supplementalSuggestionQuestionSchema = z.object({
   text: z.string().trim().min(1).max(700),
   fields: z.array(z.string().trim().min(1).max(500)).min(1).max(12),
   options: z.array(z.string().trim().min(1).max(200)).length(3).describe("具体模拟答案；规格必须给出数值与单位，组合问题的每个选项必须回答全部字段"),
-})).length(3) });
+});
+
+/** 修正百炼等模型常犯的补充选项 JSON 形状（根外包一层数组、直接返回 questions 数组）。 */
+export function normalizeSupplementalSuggestionsPayload(raw: unknown): unknown {
+  if (!Array.isArray(raw)) return raw;
+  if (raw.length === 1 && raw[0] && typeof raw[0] === "object" && !Array.isArray(raw[0]) && Array.isArray((raw[0] as { questions?: unknown }).questions)) {
+    return raw[0];
+  }
+  if (raw.every(entry => entry && typeof entry === "object" && !Array.isArray(entry) && typeof (entry as { text?: unknown }).text === "string")) {
+    return { questions: raw };
+  }
+  return raw;
+}
+
+export const supplementalSuggestionsSchema = z.preprocess(
+  normalizeSupplementalSuggestionsPayload,
+  z.object({ questions: z.array(supplementalSuggestionQuestionSchema).length(3) }),
+);
 
 export function supplementalQuestionsFromFields(fields: z.infer<typeof missingFieldSchema>[]) {
   return normalizeSupplementalQuestions(fields.map(field => ({ text: field.question, fields: [field.field], options: field.options, blocking: field.blocking, requiresImage: false })));

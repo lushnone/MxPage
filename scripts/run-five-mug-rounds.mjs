@@ -2,7 +2,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import sharp from "sharp";
-const base = "http://127.0.0.1:3000";
+const base = "http://127.0.0.1:3001";
 const configIndex = process.argv.indexOf("--config");
 const config = configIndex >= 0 ? JSON.parse(await fs.readFile(process.argv[configIndex + 1], "utf8")) : null;
 const baselineProjectId = config?.baselineProjectId || process.env.MXPAGE_BASELINE_PROJECT;
