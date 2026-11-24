@@ -9,7 +9,7 @@ import { prisma } from "@/lib/db/prisma";
 import { completeTask, createTask, failTask, findRecentRunningTask } from "@/lib/services/task-service";
 import { readStorageFile } from "@/lib/storage/asset-manager";
 import { contentLanguageLabels, normalizeContentLanguage } from "@/lib/utils/content-language";
-import { extFromMime } from "@/lib/utils/files";
+import { compressImageBufferForExport } from "@/lib/utils/export-image";
 import { assetTypeLabels, sectionTypeLabels } from "@/types/domain";
 
 function getPreviewConfig(project: { modelSnapshot: unknown } | null) {
@@ -85,6 +85,8 @@ function buildDetailAssets(project: {
 
 const EXPORT_HERO_DIR = "00-\u5934\u56fe";
 const EXPORT_DETAIL_DIR = "01-\u8be6\u60c5\u9875";
+const EXPORT_IMAGE_EXT = ".jpg";
+const EXPORT_IMAGE_MIME = "image/jpeg";
 
 function buildExportImageFileName(exportTimestamp: number, index: number, ext: string) {
   const normalizedExt = ext.startsWith(".") ? ext : `.${ext}`;
@@ -169,17 +171,15 @@ export async function buildImageArchive(projectId: string) {
 
     await Promise.all([
       ...galleryAssets.map(async (item, index) => {
-        const buffer = await readStorageFile(item.asset.filePath);
-        const ext = path.extname(item.asset.fileName) || `.${extFromMime(item.asset.mimeType)}`;
+        const buffer = await compressImageBufferForExport(await readStorageFile(item.asset.filePath));
         archive.append(buffer, {
-          name: `${EXPORT_HERO_DIR}/${buildExportImageFileName(exportTimestamp, index, ext)}`,
+          name: `${EXPORT_HERO_DIR}/${buildExportImageFileName(exportTimestamp, index, EXPORT_IMAGE_EXT)}`,
         });
       }),
       ...detailAssets.map(async (item, index) => {
-        const buffer = await readStorageFile(item.asset.filePath);
-        const ext = path.extname(item.asset.fileName) || `.${extFromMime(item.asset.mimeType)}`;
+        const buffer = await compressImageBufferForExport(await readStorageFile(item.asset.filePath));
         archive.append(buffer, {
-          name: `${EXPORT_DETAIL_DIR}/${buildExportImageFileName(exportTimestamp, index, ext)}`,
+          name: `${EXPORT_DETAIL_DIR}/${buildExportImageFileName(exportTimestamp, index, EXPORT_IMAGE_EXT)}`,
         });
       }),
     ]);
@@ -197,18 +197,10 @@ export async function buildImageArchive(projectId: string) {
         order: index + 1,
         title: item.title,
         sourceLabel: item.sourceLabel,
-        fileName: buildExportImageFileName(
-          exportTimestamp,
-          index,
-          path.extname(item.asset.fileName) || `.${extFromMime(item.asset.mimeType)}`,
-        ),
+        fileName: buildExportImageFileName(exportTimestamp, index, EXPORT_IMAGE_EXT),
         originalFileName: item.asset.fileName,
-        zipPath: `${EXPORT_HERO_DIR}/${buildExportImageFileName(
-          exportTimestamp,
-          index,
-          path.extname(item.asset.fileName) || `.${extFromMime(item.asset.mimeType)}`,
-        )}`,
-        mimeType: item.asset.mimeType,
+        zipPath: `${EXPORT_HERO_DIR}/${buildExportImageFileName(exportTimestamp, index, EXPORT_IMAGE_EXT)}`,
+        mimeType: EXPORT_IMAGE_MIME,
       })),
       details: detailAssets.map((item, index) => ({
         order: index + 1,
@@ -216,18 +208,10 @@ export async function buildImageArchive(projectId: string) {
         title: item.section.title,
         sectionType: item.section.type,
         sourceLabel: item.sourceLabel,
-        fileName: buildExportImageFileName(
-          exportTimestamp,
-          index,
-          path.extname(item.asset.fileName) || `.${extFromMime(item.asset.mimeType)}`,
-        ),
+        fileName: buildExportImageFileName(exportTimestamp, index, EXPORT_IMAGE_EXT),
         originalFileName: item.asset.fileName,
-        zipPath: `${EXPORT_DETAIL_DIR}/${buildExportImageFileName(
-          exportTimestamp,
-          index,
-          path.extname(item.asset.fileName) || `.${extFromMime(item.asset.mimeType)}`,
-        )}`,
-        mimeType: item.asset.mimeType,
+        zipPath: `${EXPORT_DETAIL_DIR}/${buildExportImageFileName(exportTimestamp, index, EXPORT_IMAGE_EXT)}`,
+        mimeType: EXPORT_IMAGE_MIME,
       })),
     };
 

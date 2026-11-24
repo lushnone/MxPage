@@ -218,7 +218,7 @@ export function DetailWorkspace({ initialProject, pageMode = "preview" }: { init
       const response = await fetch(`${base}/export/${kind}`);
       if (!response.ok) { await read(response); return; }
       const url = URL.createObjectURL(await response.blob());
-      const name = kind === "images" ? "mxpage-images.zip" : "mxpage-detail.png";
+      const name = kind === "images" ? "mxpage-images.zip" : "mxpage-detail.jpg";
       setDownloadLink({ url, name });
       const a = document.createElement("a"); a.href = url; a.download = name;
       document.body.appendChild(a); a.click(); a.remove();

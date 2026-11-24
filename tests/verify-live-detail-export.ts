@@ -4,7 +4,7 @@ import { mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { createRequire } from "node:module";
 import sharp from "sharp";
-import { stitchDetailImages } from "../lib/detail-runs/long-image";
+import { exportLongImage } from "../lib/detail-runs/long-image";
 
 async function main() {
   const [projectId, outputDirectory] = process.argv.slice(2);
@@ -47,8 +47,12 @@ async function main() {
     const assetUrl = new URL(section.imageUrl, base);
     assert.equal(assetUrl.origin, new URL(base).origin);
     const currentBytes = Buffer.from(await (await fetch(assetUrl)).arrayBuffer());
-    assert.deepEqual(bytes, currentBytes, "ZIP must contain the current effective version in order");
+    assert.notDeepEqual(bytes, currentBytes, "ZIP must be compressed export JPEG, not the stored original");
     const meta = await sharp(bytes).metadata();
+    assert.equal(meta.format, "jpeg");
+    const originalMeta = await sharp(currentBytes).metadata();
+    assert.equal(meta.width, originalMeta.width);
+    assert.equal(meta.height, originalMeta.height);
     assert.ok(meta.width && meta.height);
     dimensions.push({ title: section.title, type: section.type, width: meta.width, height: meta.height });
   }
@@ -56,16 +60,18 @@ async function main() {
   const long = Buffer.from(await longResponse.arrayBuffer());
   const longMetadata = await sharp(long).metadata();
   assert.equal(longMetadata.width, 1080);
-  assert.deepEqual(long, await stitchDetailImages(manifest.details.map((d: any) => entries.get(d.zipPath)!)), "Long image must exactly match ordered ZIP detail images");
+  assert.equal(longMetadata.format, "jpeg");
+  const expectedLong = await exportLongImage(projectId);
+  assert.deepEqual(long, expectedLong, "Long image must match export pipeline output");
   const result = {
     projectId, runId: run.id, status: run.status, verifiedAt: new Date().toISOString(),
     heroCount: heroes.length, detailCount: details.length, dimensions,
     longImage: { width: longMetadata.width, height: longMetadata.height },
-    zipEntries: entries.size, currentVersionsMatch: true, zipAndLongMatch: true,
+    zipEntries: entries.size, exportJpeg: true, longExportJpeg: true,
     totalVersions: project.sections.reduce((total: number, section: any) => total + section.versions.length, 0),
     corrections: run.checkpoint.images.map((i: any) => ({ title: i.title, correctionCount: i.correctionCount, check: i.check })),
   };
-  await writeFile(path.join(output, "charger-detail.png"), long);
+  await writeFile(path.join(output, "charger-detail.jpg"), long);
   await writeFile(path.join(output, "charger-images.zip"), zip);
   await writeFile(path.join(output, "export-verification.json"), JSON.stringify(result, null, 2), "utf8");
   console.log(JSON.stringify(result, null, 2));

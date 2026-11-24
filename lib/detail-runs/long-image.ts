@@ -1,6 +1,7 @@
 import sharp from "sharp";
 import { prisma } from "@/lib/db/prisma";
 import { readStorageFile } from "@/lib/storage/asset-manager";
+import { EXPORT_JPEG_QUALITY } from "@/lib/utils/export-image";
 
 export async function stitchDetailImages(buffers: Buffer[]) {
   if (!buffers.length) throw new Error("没有可导出的详情图片。");
@@ -12,7 +13,10 @@ export async function stitchDetailImages(buffers: Buffer[]) {
     height += image.info.height;
     if (height > 50000) throw new Error("长图高度超过 50000px，请下载分图 ZIP。");
   }
-  return sharp({ create: { width: 1080, height, channels: 4, background: "white" } }).composite(overlays).png().toBuffer();
+  return sharp({ create: { width: 1080, height, channels: 4, background: "white" } })
+    .composite(overlays)
+    .jpeg({ quality: EXPORT_JPEG_QUALITY })
+    .toBuffer();
 }
 
 export async function exportLongImage(projectId: string) {
